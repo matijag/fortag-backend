@@ -1,0 +1,21 @@
+services:
+  scanner:
+    build:
+      context: ./scanner
+      args:
+        BUILD_VERSION: dev
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      MQTT_USER: ${MQTT_USER:-}
+      MQTT_PASSWORD: ${MQTT_PASSWORD:-}
+    volumes:
+      - fortag-data:/app/data
+    command:
+      - -db
+      - /app/data/scanner.db
+      - -mqtt
+      - tcp://127.0.0.1:1883
+
+volumes:
+  fortag-data:

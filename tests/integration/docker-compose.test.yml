@@ -1,0 +1,31 @@
+services:
+  test-mqtt:
+    image: eclipse-mosquitto:latest
+    ports:
+      - "1883:1883"
+    command:
+      - sh
+      - -c
+      - |
+        printf 'listener 1883\nallow_anonymous true\n' > /tmp/mosquitto.conf
+        exec mosquitto -c /tmp/mosquitto.conf
+    healthcheck:
+      test: ["CMD", "mosquitto_sub", "-t", "$$SYS/#", "-C", "1", "-p", "1883"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  test-scanner:
+    build:
+      context: ../../scanner
+      args:
+        BUILD_VERSION: integration-test
+    network_mode: host
+    environment:
+      - DB_PATH=/app/data/test.db
+    tmpfs:
+      - /app/data
+    depends_on:
+      test-mqtt:
+        condition: service_healthy
+    command: ["-db", "/app/data/test.db", "-mqtt", "tcp://localhost:1883", "-range", "${SCAN_RANGE}", "-freq", "1h"]

@@ -1,0 +1,12 @@
+.git
+.env
+.env.*
+fortag.env
+data
+*.db
+*.db-*
+*.db.lock
+*.sqlite
+*.sqlite3
+*.log
+scanner

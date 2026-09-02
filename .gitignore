@@ -1,0 +1,28 @@
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+fortag.env
+*.pem
+*.key
+
+# Scanner state and output
+data/
+*.db
+*.db-*
+*.db.lock
+*.sqlite
+*.sqlite3
+*.log
+
+# Build and editor output
+scanner/scanner
+dist/
+coverage/
+.DS_Store
+.idea/
+.vscode/
+
+# Go tooling
+bin/
+vendor/

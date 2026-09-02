@@ -1,0 +1,18 @@
+FROM golang:1.26.5-alpine
+
+# Install Docker CLI and Docker Compose
+RUN apk add --no-cache docker-cli docker-compose docker-cli-buildx
+
+WORKDIR /app
+
+# Copy the entire project so go mod tidy can see imports
+COPY . .
+
+WORKDIR /app/scanner
+RUN go mod tidy
+
+WORKDIR /app/tests/integration
+RUN go mod tidy
+
+# Run both Go unit tests (scanner) and integration tests
+ENTRYPOINT ["sh", "-c", "cd /app/scanner && go test -v ./... && cd /app/tests/integration && go test -v ."]
