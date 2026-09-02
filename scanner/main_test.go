@@ -102,7 +102,7 @@ func TestConfigureScanRangePreservesOverrideWhenDetectionFails(t *testing.T) {
 
 func TestSecurityAlerts(t *testing.T) {
 	results := []ScanResult{{
-		MAC: "00:11:22:33:44:55", IP: "192.168.1.5", IsNewHost: true,
+		MAC: "00:11:22:33:44:55", IP: "192.168.1.5", CustomName: "Office Printer", IsNewHost: true,
 		Ports: []PortResult{{Port: 80, Protocol: "tcp", IsNew: true}, {Port: 22, Protocol: "tcp"}},
 	}, {
 		MAC: "02:11:22:33:44:66", IP: "192.168.1.6", MatchedFrom: "02:11:22:33:44:55",
@@ -118,6 +118,11 @@ func TestSecurityAlerts(t *testing.T) {
 	}
 	if alerts[1].alertType != "new_port" || alerts[1].extra["port"] != 80 {
 		t.Errorf("unexpected port alert: %#v", alerts[1])
+	}
+	for _, alert := range alerts {
+		if alert.extra["custom_name"] != "Office Printer" {
+			t.Errorf("alert custom name = %v, want Office Printer", alert.extra["custom_name"])
+		}
 	}
 }
 

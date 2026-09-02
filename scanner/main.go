@@ -81,21 +81,33 @@ type securityAlert struct {
 func securityAlerts(results []ScanResult) []securityAlert {
 	var alerts []securityAlert
 	for _, result := range results {
+		hostDetails := map[string]interface{}{}
+		if result.CustomName != "" {
+			hostDetails["custom_name"] = result.CustomName
+		}
 		if result.IsNewHost {
+			extra := map[string]interface{}{"ip": result.IP}
+			for key, value := range hostDetails {
+				extra[key] = value
+			}
 			alerts = append(alerts, securityAlert{
 				alertType: "new_host",
 				mac:       result.MAC,
-				extra:     map[string]interface{}{"ip": result.IP},
+				extra:     extra,
 			})
 		}
 		for _, port := range result.Ports {
 			if port.IsNew {
+				extra := map[string]interface{}{
+					"port": port.Port, "protocol": port.Protocol,
+				}
+				for key, value := range hostDetails {
+					extra[key] = value
+				}
 				alerts = append(alerts, securityAlert{
 					alertType: "new_port",
 					mac:       result.MAC,
-					extra: map[string]interface{}{
-						"port": port.Port, "protocol": port.Protocol,
-					},
+					extra:     extra,
 				})
 			}
 		}

@@ -81,7 +81,8 @@ Publishes security events for new hosts or new open ports.
     {
       "type": "new_host",
       "mac": "string (MAC address)",
-      "ip": "string (IP address)"
+      "ip": "string (IP address)",
+      "custom_name": "string (optional user-assigned host name)"
     }
     ```
 *   **JSON Schema (New Port):**
@@ -90,7 +91,8 @@ Publishes security events for new hosts or new open ports.
       "type": "new_port",
       "mac": "string (MAC address)",
       "port": "integer",
-      "protocol": "string (e.g., 'tcp')"
+      "protocol": "string (e.g., 'tcp')",
+      "custom_name": "string (optional user-assigned host name)"
     }
     ```
 
