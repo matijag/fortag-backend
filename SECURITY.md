@@ -12,7 +12,7 @@ database files, or other sensitive data.
 
 ## Operational safety
 
-Fortag invokes Nmap and must only be used against networks the operator owns or
-has explicit permission to assess. Configure authentication and transport
+Fortag performs active network scans and must only be used against networks the
+operator owns or has explicit permission to assess. Configure authentication and transport
 security on production MQTT brokers. The anonymous Mosquitto configuration in
 the integration tests is intended only for an isolated test environment.

@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"log"
 	"os/exec"
@@ -10,78 +12,108 @@ import (
 	"time"
 )
 
-// NmapRun represents the root of the nmap XML output
-type NmapRun struct {
-	Hosts []Host `xml:"host"`
+const defaultEngineStallTimeout = 15 * time.Minute
+
+type NmapEngine struct {
+	Executable   string
+	StallTimeout time.Duration
 }
 
-type Host struct {
-	Addresses []Address  `xml:"address"`
-	Hostnames []Hostname `xml:"hostnames>hostname"`
-	Ports     []Port     `xml:"ports>port"`
-	OS        OS         `xml:"os"`
+func NewNmapEngine() *NmapEngine {
+	return &NmapEngine{Executable: "nmap", StallTimeout: defaultEngineStallTimeout}
 }
 
-type Address struct {
+func (e *NmapEngine) Name() string { return "nmap" }
+
+func (e *NmapEngine) Capabilities() EngineCapabilities {
+	return EngineCapabilities{
+		HostDiscovery: true,
+		MACAddresses:  true,
+		Hostnames:     true,
+		OS:            true,
+		Services:      true,
+		Scripts:       true,
+	}
+}
+
+// nmapRun and the related types are private to the adapter. Nothing outside
+// this file should depend on the engine's XML schema.
+type nmapRun struct {
+	Hosts []nmapHost `xml:"host"`
+}
+
+type nmapHost struct {
+	Addresses []nmapAddress  `xml:"address"`
+	Hostnames []nmapHostname `xml:"hostnames>hostname"`
+	Ports     []nmapPort     `xml:"ports>port"`
+	OS        nmapOS         `xml:"os"`
+}
+
+type nmapAddress struct {
 	Addr     string `xml:"addr,attr"`
 	AddrType string `xml:"addrtype,attr"`
 }
 
-type Hostname struct {
+type nmapHostname struct {
 	Name string `xml:"name,attr"`
 	Type string `xml:"type,attr"`
 }
 
-type Port struct {
-	PortID   int      `xml:"portid,attr"`
-	Protocol string   `xml:"protocol,attr"`
-	State    State    `xml:"state"`
-	Service  Service  `xml:"service"`
-	Scripts  []Script `xml:"script"`
+type nmapPort struct {
+	PortID   int          `xml:"portid,attr"`
+	Protocol string       `xml:"protocol,attr"`
+	State    nmapState    `xml:"state"`
+	Service  nmapService  `xml:"service"`
+	Scripts  []nmapScript `xml:"script"`
 }
 
-type OS struct {
-	Matches []OSMatch `xml:"osmatch"`
+type nmapOS struct {
+	Matches []nmapOSMatch `xml:"osmatch"`
 }
 
-type OSMatch struct {
+type nmapOSMatch struct {
 	Name     string `xml:"name,attr"`
 	Accuracy int    `xml:"accuracy,attr"`
 }
 
-type Script struct {
+type nmapScript struct {
 	ID     string `xml:"id,attr"`
 	Output string `xml:"output,attr"`
 }
 
-type State struct {
+type nmapState struct {
 	State string `xml:"state,attr"`
 }
 
-type Service struct {
+type nmapService struct {
 	Name string `xml:"name,attr"`
 	Desc string `xml:"product,attr"`
 }
 
-func RunHostDiscovery(target string) ([]string, error) {
-	if err := ValidateScanTarget(target); err != nil {
-		return nil, fmt.Errorf("host-discovery target rejected: %w", err)
+func (e *NmapEngine) Discover(ctx context.Context, request DiscoveryRequest) (DiscoveryResult, error) {
+	if err := ValidateScanTarget(request.Target); err != nil {
+		return DiscoveryResult{}, e.engineError(EngineErrorValidation, "discover", request.Target, err)
 	}
 
 	// -sn: No port scan
 	// -n: No DNS
-	args := []string{"-oX", "-", "-sn", "-n", "--max-retries", "2", target}
+	args := []string{"-oX", "-", "-sn", "-n", "--max-retries", "2", request.Target}
 	log.Printf("DEBUG: Executing Host Discovery: nmap %v", args)
 
-	cmd := exec.Command("nmap", args...)
+	cmd := exec.CommandContext(ctx, e.executable(), args...)
+	configureProcessGroup(cmd)
 	output, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("host discovery failed: %w", err)
+		kind := EngineErrorExecution
+		if errors.Is(ctx.Err(), context.Canceled) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			kind = EngineErrorCancelled
+		}
+		return DiscoveryResult{}, e.engineError(kind, "discover", request.Target, err)
 	}
 
-	var result NmapRun
+	var result nmapRun
 	if err := xml.Unmarshal(output, &result); err != nil {
-		return nil, fmt.Errorf("failed to parse discovery output: %w", err)
+		return DiscoveryResult{}, e.engineError(EngineErrorOutput, "discover", request.Target, err)
 	}
 
 	var ips []string
@@ -92,34 +124,34 @@ func RunHostDiscovery(target string) ([]string, error) {
 			}
 		}
 	}
-	return ips, nil
+	return DiscoveryResult{Targets: ips}, nil
 }
 
-func RunScan(target string, flags []string) (*NmapRun, error) {
-	if err := ValidateScanTarget(target); err != nil {
-		return nil, fmt.Errorf("port-scan target rejected: %w", err)
+func (e *NmapEngine) Scan(ctx context.Context, request PortScanRequest) (EngineScanResult, error) {
+	if err := ValidateScanTarget(request.Target); err != nil {
+		return EngineScanResult{}, e.engineError(EngineErrorValidation, "scan", request.Target, err)
 	}
 
 	// Request stats every 30 seconds to ensure progressive output
 	// -n: disable DNS
 	// --max-retries 2: avoid getting stuck on bad hosts
-	args := append([]string{"-oX", "-", "-n", "--max-retries", "2", "--stats-every", "30s"}, flags...)
-	args = append(args, target)
+	args := []string{"-oX", "-", "-n", "--max-retries", "2", "--stats-every", "30s", "-A", "-T4", request.Target}
 
 	log.Printf("DEBUG: Executing: nmap %v", args)
-	cmd := exec.Command("nmap", args...)
+	cmd := exec.CommandContext(ctx, e.executable(), args...)
+	configureProcessGroup(cmd)
 
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, err
+		return EngineScanResult{}, e.engineError(EngineErrorStart, "scan", request.Target, err)
 	}
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
-		return nil, err
+		return EngineScanResult{}, e.engineError(EngineErrorStart, "scan", request.Target, err)
 	}
 
 	if err := cmd.Start(); err != nil {
-		return nil, err
+		return EngineScanResult{}, e.engineError(EngineErrorStart, "scan", request.Target, err)
 	}
 	log.Printf("DEBUG: Nmap process started with PID %d", cmd.Process.Pid)
 
@@ -168,7 +200,7 @@ func RunScan(target string, flags []string) (*NmapRun, error) {
 		done <- cmd.Wait()
 	}()
 
-	timeoutDuration := 15 * time.Minute
+	timeoutDuration := e.stallTimeout()
 	timer := time.NewTimer(timeoutDuration)
 	defer timer.Stop()
 
@@ -192,28 +224,93 @@ func RunScan(target string, flags []string) (*NmapRun, error) {
 				strings.Contains(str, "<status") {
 				log.Print("DEBUG Nmap progress: " + str)
 			}
+			if request.Progress != nil {
+				request.Progress(EngineProgress{Phase: "scanning_ports", Target: request.Target, Message: str})
+			}
+
+		case <-ctx.Done():
+			if cmd.Process != nil {
+				_ = killProcessGroup(cmd)
+			}
+			<-done
+			return EngineScanResult{}, e.engineError(EngineErrorCancelled, "scan", request.Target, ctx.Err())
 
 		case <-timer.C:
 			if cmd.Process != nil {
 				log.Printf("CRITICAL: Nmap PID %d timed out after %v", cmd.Process.Pid, timeoutDuration)
-				if err := cmd.Process.Kill(); err != nil {
+				if err := killProcessGroup(cmd); err != nil && !errors.Is(err, context.Canceled) {
 					log.Printf("ERROR: Failed to kill timed-out nmap PID %d: %v", cmd.Process.Pid, err)
 				}
 			}
 			<-done
-			return nil, fmt.Errorf("nmap stalled: no output for %v", timeoutDuration)
+			return EngineScanResult{}, e.engineError(EngineErrorTimeout, "scan", request.Target, fmt.Errorf("no output for %v", timeoutDuration))
 
 		case err := <-done:
 			if err != nil {
-				return nil, fmt.Errorf("nmap execution failed: %w (stderr + partial stdout size: %d)", err, outputBuf.Len())
+				kind := EngineErrorExecution
+				if ctx.Err() != nil {
+					kind = EngineErrorCancelled
+				}
+				return EngineScanResult{}, e.engineError(kind, "scan", request.Target, fmt.Errorf("%w (stderr + partial stdout size: %d)", err, outputBuf.Len()))
 			}
 
 			log.Printf("DEBUG: Nmap execution finished successfully. Output size: %d bytes", outputBuf.Len())
-			var result NmapRun
+			var result nmapRun
 			if err := xml.Unmarshal(outputBuf.Bytes(), &result); err != nil {
-				return nil, fmt.Errorf("failed to parse nmap output: %w", err)
+				return EngineScanResult{}, e.engineError(EngineErrorOutput, "scan", request.Target, err)
 			}
-			return &result, nil
+			return result.toEngineResult(), nil
 		}
 	}
+}
+
+func (e *NmapEngine) executable() string {
+	if e.Executable == "" {
+		return "nmap"
+	}
+	return e.Executable
+}
+
+func (e *NmapEngine) stallTimeout() time.Duration {
+	if e.StallTimeout <= 0 {
+		return defaultEngineStallTimeout
+	}
+	return e.StallTimeout
+}
+
+func (e *NmapEngine) engineError(kind EngineErrorKind, op, target string, err error) error {
+	return &EngineError{Engine: e.Name(), Kind: kind, Op: op, Target: target, Err: err}
+}
+
+func (run nmapRun) toEngineResult() EngineScanResult {
+	result := EngineScanResult{Hosts: make([]ObservedHost, 0, len(run.Hosts))}
+	for _, host := range run.Hosts {
+		observed := ObservedHost{}
+		for _, address := range host.Addresses {
+			switch address.AddrType {
+			case "mac":
+				observed.MAC = address.Addr
+			case "ipv4":
+				observed.IP = address.Addr
+			}
+		}
+		if len(host.Hostnames) > 0 {
+			observed.Hostname = host.Hostnames[0].Name
+		}
+		if len(host.OS.Matches) > 0 {
+			observed.OS = host.OS.Matches[0].Name
+		}
+		for _, port := range host.Ports {
+			converted := ObservedPort{
+				Port: port.PortID, Protocol: port.Protocol, State: port.State.State,
+				Service: port.Service.Name,
+			}
+			for _, script := range port.Scripts {
+				converted.Scripts = append(converted.Scripts, ObservedScript{ID: script.ID, Output: script.Output})
+			}
+			observed.Ports = append(observed.Ports, converted)
+		}
+		result.Hosts = append(result.Hosts, observed)
+	}
+	return result
 }

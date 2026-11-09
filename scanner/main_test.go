@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"path/filepath"
@@ -9,6 +10,24 @@ import (
 
 	_ "modernc.org/sqlite"
 )
+
+func TestSafeScanFailureDoesNotExposeRawError(t *testing.T) {
+	report := safeScanFailure("discovery", &EngineError{
+		Kind: EngineErrorStart,
+		Err:  errors.New("secret filesystem path and broker address"),
+	})
+	if report.code != "discovery_unavailable" || report.message != "Host discovery could not start" {
+		t.Fatalf("unexpected report: %#v", report)
+	}
+	if strings.Contains(report.detail, "secret") {
+		t.Fatalf("raw error leaked into report: %#v", report)
+	}
+
+	timeout := safeScanFailure("port_scan", context.DeadlineExceeded)
+	if timeout.code != "port_scan_timeout" {
+		t.Fatalf("timeout report = %#v", timeout)
+	}
+}
 
 func TestGetCurrentRangeFallsBackWithoutPersistingAndReadsSQLite(t *testing.T) {
 	db, err := sql.Open("sqlite", ":memory:")

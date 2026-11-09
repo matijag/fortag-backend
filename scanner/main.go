@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"flag"
@@ -21,6 +22,55 @@ const mqttAPIVersion = 2
 
 // scannerVersion is set at build time with -ldflags. Local builds report "dev".
 var scannerVersion = "dev"
+
+type scanFailure struct {
+	code    string
+	message string
+	detail  string
+}
+
+func safeScanFailure(operation string, err error) scanFailure {
+	label := "Port scan"
+	if operation == "discovery" {
+		label = "Host discovery"
+	}
+	kind := EngineErrorExecution
+	var engineErr *EngineError
+	if errors.As(err, &engineErr) {
+		kind = engineErr.Kind
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		kind = EngineErrorTimeout
+	}
+	switch kind {
+	case EngineErrorValidation:
+		return scanFailure{operation + "_invalid", label + " configuration was rejected", "The target or scanner settings are invalid."}
+	case EngineErrorStart:
+		return scanFailure{operation + "_unavailable", label + " could not start", "Required scanner resources or permissions are unavailable."}
+	case EngineErrorTimeout:
+		return scanFailure{operation + "_timeout", label + " timed out", "The operation exceeded its safety timeout before it completed."}
+	case EngineErrorCancelled:
+		return scanFailure{operation + "_cancelled", label + " was cancelled", "The scanner stopped the operation before it completed."}
+	case EngineErrorOutput:
+		return scanFailure{operation + "_invalid_result", label + " returned invalid results", "The scanner rejected malformed or unsafe result data."}
+	default:
+		return scanFailure{operation + "_failed", label + " failed", "A network or scanner error stopped the operation."}
+	}
+}
+
+func summarizeScanFailures(failures []scanFailure) scanFailure {
+	if len(failures) == 0 {
+		return scanFailure{"scan_incomplete", "Scan completed with errors", "One or more results may be incomplete."}
+	}
+	if len(failures) == 1 {
+		return failures[0]
+	}
+	return scanFailure{
+		"scan_incomplete",
+		"Scan completed with multiple errors",
+		fmt.Sprintf("%d problems occurred. First problem: %s", len(failures), failures[0].detail),
+	}
+}
 
 func getCurrentRange(db *sql.DB, defaultRange string) (string, error) {
 	var val string
@@ -274,6 +324,7 @@ func main() {
 	log.Printf("Home Assistant approved scanner %s instance %s", identity.UUID, instanceID)
 
 	var scanInProgress atomic.Bool
+	var scanEngine ScanEngine = NewNativeEngine()
 
 	publishCurrentState := func() error {
 		res, err := getAllScanResults(db)
@@ -315,7 +366,6 @@ func main() {
 			return
 		}
 		defer scanInProgress.Store(false)
-		defer mqttClient.PublishProgress("idle", "")
 
 		startTime := time.Now()
 		rangeToScan, err := getCurrentRange(db, fallbackRange.Load().(string))
@@ -324,37 +374,51 @@ func main() {
 			if historyErr := RecordScanHistory(db, time.Since(startTime), "failed", err.Error()); historyErr != nil {
 				log.Printf("ERROR: Failed to record scan range failure: %v", historyErr)
 			}
+			mqttClient.PublishScanOutcome(
+				"failed", "invalid_scan_range", "Scan could not start",
+				"The configured scan range is invalid or unavailable.",
+			)
 			return
 		}
 		log.Printf("Starting phased scan of %s", rangeToScan)
 
 		mqttClient.PublishProgress("scanning_hosts", rangeToScan)
-		ips, err := RunHostDiscovery(rangeToScan)
+		discovery, err := scanEngine.Discover(context.Background(), DiscoveryRequest{Target: rangeToScan})
 		if err != nil {
 			log.Printf("Discovery failed: %v", err)
 			duration := time.Since(startTime)
 			if historyErr := RecordScanHistory(db, duration, "failed", err.Error()); historyErr != nil {
 				log.Printf("ERROR: Failed to record discovery failure: %v", historyErr)
 			}
+			failure := safeScanFailure("discovery", err)
+			mqttClient.PublishScanOutcome("failed", failure.code, failure.message, failure.detail)
 			return
 		}
 
-		log.Printf("Found %d up hosts. Starting targeted deep scans...", len(ips))
+		log.Printf("Found %d up hosts. Starting targeted deep scans with %s...", len(discovery.Targets), scanEngine.Name())
+		discoveredMACs := make(map[string]string, len(discovery.Hosts))
+		for _, host := range discovery.Hosts {
+			discoveredMACs[host.IP] = host.MAC
+		}
 		var scanErrors []string
+		var safeFailures []scanFailure
 		var currentMACs []string
-		for _, ip := range ips {
-			mqttClient.PublishProgress("scanning_ports", ip)
-			nmapRun, err := RunScan(ip, []string{"-A", "-T4"})
-			if err != nil {
-				log.Printf("Scan failed for %s: %v", ip, err)
-				scanErrors = append(scanErrors, fmt.Sprintf("%s: nmap: %v", ip, err))
-				continue
+		processResult := func(label string, engineResult EngineScanResult, scanErr error) {
+			if scanErr != nil {
+				log.Printf("Scan failed for %s: %v", label, scanErr)
+				scanErrors = append(scanErrors, fmt.Sprintf("%s: %s: %v", label, scanEngine.Name(), scanErr))
+				safeFailures = append(safeFailures, safeScanFailure("port_scan", scanErr))
+				return
 			}
-			processed, err := ProcessScan(db, nmapRun)
-			if err != nil {
-				log.Printf("Failed to process scan for %s: %v", ip, err)
-				scanErrors = append(scanErrors, fmt.Sprintf("%s: persistence: %v", ip, err))
-				continue
+			processed, processErr := ProcessScan(db, engineResult)
+			if processErr != nil {
+				log.Printf("Failed to process scan for %s: %v", label, processErr)
+				scanErrors = append(scanErrors, fmt.Sprintf("%s: persistence: %v", label, processErr))
+				safeFailures = append(safeFailures, scanFailure{
+					code: "database_write_failed", message: "Scan results could not be saved",
+					detail: "The scanner database rejected one or more result updates.",
+				})
+				return
 			}
 			for _, alert := range securityAlerts(processed) {
 				mqttClient.PublishAlert(alert.alertType, alert.mac, alert.extra)
@@ -363,10 +427,44 @@ func main() {
 				currentMACs = append(currentMACs, result.MAC)
 			}
 		}
+		if batchEngine, ok := scanEngine.(BatchScanEngine); ok {
+			requests := make([]PortScanRequest, 0, len(discovery.Targets))
+			for _, ip := range discovery.Targets {
+				priorityPorts, priorityErr := getKnownOpenPorts(db, discoveredMACs[ip])
+				if priorityErr != nil {
+					scanErrors = append(scanErrors, fmt.Sprintf("%s: prior ports: %v", ip, priorityErr))
+					safeFailures = append(safeFailures, scanFailure{
+						code: "database_read_failed", message: "Previous port history could not be read",
+						detail: "One or more hosts were skipped because their saved port history was unavailable.",
+					})
+					continue
+				}
+				requests = append(requests, PortScanRequest{
+					Target:        ip,
+					MAC:           discoveredMACs[ip],
+					PriorityPorts: priorityPorts,
+					Progress: func(progress EngineProgress) {
+						mqttClient.PublishProgress("scanning_ports", progress.Target)
+					},
+				})
+			}
+			engineResult, scanErr := batchEngine.ScanBatch(context.Background(), requests)
+			processResult("discovered hosts", engineResult, scanErr)
+		} else {
+			for _, ip := range discovery.Targets {
+				mqttClient.PublishProgress("scanning_ports", ip)
+				engineResult, scanErr := scanEngine.Scan(context.Background(), PortScanRequest{Target: ip, MAC: discoveredMACs[ip]})
+				processResult(ip, engineResult, scanErr)
+			}
+		}
 
 		if err := setCurrentHosts(db, currentMACs); err != nil {
 			log.Printf("Failed to update current hosts: %v", err)
 			scanErrors = append(scanErrors, fmt.Sprintf("current hosts: %v", err))
+			safeFailures = append(safeFailures, scanFailure{
+				code: "database_write_failed", message: "Current host state could not be saved",
+				detail: "The displayed current-host set may be stale.",
+			})
 		}
 
 		duration := time.Since(startTime)
@@ -378,12 +476,28 @@ func main() {
 		}
 		if err := RecordScanHistory(db, duration, status, errMessage); err != nil {
 			log.Printf("ERROR: Failed to record scan history: %v", err)
+			status = "partial"
+			safeFailures = append(safeFailures, scanFailure{
+				code: "scan_history_write_failed", message: "Scan completion could not be recorded",
+				detail: "Results may be current, but the last successful scan time could not be updated.",
+			})
 		}
 
 		// Final full state publish uses the persisted scan-history metrics so
 		// later rename/acknowledge refreshes cannot corrupt them.
 		if err := publishCurrentState(); err != nil {
 			log.Printf("ERROR: Failed to publish state after scan: %v", err)
+			status = "partial"
+			safeFailures = append(safeFailures, scanFailure{
+				code: "state_publish_failed", message: "Updated results could not be published",
+				detail: "Home Assistant may continue showing results from the previous successful scan.",
+			})
+		}
+		if status == "partial" {
+			failure := summarizeScanFailures(safeFailures)
+			mqttClient.PublishScanOutcome("partial", failure.code, failure.message, failure.detail)
+		} else {
+			mqttClient.PublishScanOutcome("success", "", "Scan completed successfully", "")
 		}
 	}
 

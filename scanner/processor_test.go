@@ -19,16 +19,12 @@ func TestProcessScan(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Mock Nmap Output
-	mockRun := &NmapRun{
-		Hosts: []Host{
+	mockRun := EngineScanResult{
+		Hosts: []ObservedHost{
 			{
-				Addresses: []Address{
-					{Addr: "00:11:22:33:44:55", AddrType: "mac"},
-					{Addr: "192.168.1.50", AddrType: "ipv4"},
-				},
-				Ports: []Port{
-					{PortID: 80, Protocol: "tcp", State: State{State: "open"}, Service: Service{Name: "http"}},
+				MAC: "00:11:22:33:44:55", IP: "192.168.1.50",
+				Ports: []ObservedPort{
+					{Port: 80, Protocol: "tcp", State: "open", Service: "http"},
 				},
 			},
 		},
@@ -51,8 +47,8 @@ func TestProcessScan(t *testing.T) {
 	}
 
 	// Second scan - Same Host, New Port
-	mockRun.Hosts[0].Ports = append(mockRun.Hosts[0].Ports, Port{
-		PortID: 443, Protocol: "tcp", State: State{State: "open"}, Service: Service{Name: "https"},
+	mockRun.Hosts[0].Ports = append(mockRun.Hosts[0].Ports, ObservedPort{
+		Port: 443, Protocol: "tcp", State: "open", Service: "https",
 	})
 
 	results, err = ProcessScan(db, mockRun)
@@ -75,9 +71,9 @@ func TestProcessScan(t *testing.T) {
 	if _, err := db.Exec("UPDATE ports SET acknowledged = TRUE WHERE mac = ?", "00:11:22:33:44:55"); err != nil {
 		t.Fatal(err)
 	}
-	mockRun.Hosts[0].Ports = []Port{
-		{PortID: 443, Protocol: "tcp", State: State{State: "closed"}, Service: Service{Name: "https"}},
-		{PortID: 22, Protocol: "tcp", State: State{State: "filtered"}, Service: Service{Name: "ssh"}},
+	mockRun.Hosts[0].Ports = []ObservedPort{
+		{Port: 443, Protocol: "tcp", State: "closed", Service: "https"},
+		{Port: 22, Protocol: "tcp", State: "filtered", Service: "ssh"},
 	}
 	results, err = ProcessScan(db, mockRun)
 	if err != nil {
@@ -98,8 +94,8 @@ func TestProcessScan(t *testing.T) {
 
 	// Reopening a previously closed, acknowledged port is a fresh,
 	// unacknowledged security exposure.
-	mockRun.Hosts[0].Ports = []Port{
-		{PortID: 80, Protocol: "tcp", State: State{State: "open"}, Service: Service{Name: "http"}},
+	mockRun.Hosts[0].Ports = []ObservedPort{
+		{Port: 80, Protocol: "tcp", State: "open", Service: "http"},
 	}
 	results, err = ProcessScan(db, mockRun)
 	if err != nil {
@@ -111,10 +107,10 @@ func TestProcessScan(t *testing.T) {
 }
 
 func TestGenerateFingerprintUsesOnlyOpenPorts(t *testing.T) {
-	openOnly := []Port{{PortID: 80, Protocol: "tcp", State: State{State: "open"}}}
-	withClosed := append(append([]Port{}, openOnly...),
-		Port{PortID: 22, Protocol: "tcp", State: State{State: "closed"}},
-		Port{PortID: 443, Protocol: "tcp", State: State{State: "filtered"}},
+	openOnly := []ObservedPort{{Port: 80, Protocol: "tcp", State: "open"}}
+	withClosed := append(append([]ObservedPort{}, openOnly...),
+		ObservedPort{Port: 22, Protocol: "tcp", State: "closed"},
+		ObservedPort{Port: 443, Protocol: "tcp", State: "filtered"},
 	)
 	if generateFingerprint("device", openOnly) != generateFingerprint("device", withClosed) {
 		t.Fatal("closed or filtered ports changed the device fingerprint")
@@ -135,10 +131,9 @@ func TestProcessScanPreservesKnownMetadataWhenNewScanIsEmpty(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	run := &NmapRun{Hosts: []Host{{Addresses: []Address{
-		{Addr: "00:11:22:33:44:55", AddrType: "mac"},
-		{Addr: "192.168.1.50", AddrType: "ipv4"},
-	}}}}
+	run := EngineScanResult{Hosts: []ObservedHost{{
+		MAC: "00:11:22:33:44:55", IP: "192.168.1.50",
+	}}}
 	results, err := ProcessScan(db, run)
 	if err != nil {
 		t.Fatal(err)
@@ -155,6 +150,38 @@ func TestProcessScanPreservesKnownMetadataWhenNewScanIsEmpty(t *testing.T) {
 	}
 }
 
+func TestProcessScanClearsMetadataUnavailableFromEngine(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO hosts (mac, ip, hostname, os_info)
+		VALUES ('00:11:22:33:44:55', '192.168.1.50', 'stale-nmap-host', 'Stale Nmap OS')`); err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := ProcessScan(db, EngineScanResult{Hosts: []ObservedHost{{
+		MAC: "00:11:22:33:44:55", IP: "192.168.1.50", ClearMissingMetadata: true,
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if results[0].Hostname != "" || results[0].OS != "" {
+		t.Fatalf("stale metadata was published: %#v", results[0])
+	}
+	var hostname, osInfo string
+	if err := db.QueryRow("SELECT hostname, os_info FROM hosts WHERE mac = '00:11:22:33:44:55'").Scan(&hostname, &osInfo); err != nil {
+		t.Fatal(err)
+	}
+	if hostname != "" || osInfo != "" {
+		t.Fatalf("stale metadata was retained: hostname=%q os=%q", hostname, osInfo)
+	}
+}
+
 func TestLatestScanMetrics(t *testing.T) {
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
@@ -167,7 +194,9 @@ func TestLatestScanMetrics(t *testing.T) {
 	if _, err := db.Exec(`INSERT INTO scan_history
 		(timestamp, duration_seconds, status) VALUES
 		('2026-08-22 10:00:00', 12, 'success'),
-		('2026-08-22 11:30:45', 34, 'success')`); err != nil {
+		('2026-08-22 11:30:45', 34, 'success'),
+		('2026-08-22 12:00:00', 50, 'partial'),
+		('2026-08-22 12:30:00', 3, 'failed')`); err != nil {
 		t.Fatal(err)
 	}
 	lastScan, duration, err := LatestScanMetrics(db)

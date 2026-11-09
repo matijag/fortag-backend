@@ -34,3 +34,18 @@ func TestPruneCommandCacheExpiresAndBoundsEntries(t *testing.T) {
 		t.Fatal("oldest command was not evicted")
 	}
 }
+
+func TestProgressPayloadsRemainCompatibleWithAPIVersion2(t *testing.T) {
+	active := progressPayload("scanner", "instance", "scanning_ports", "192.0.2.1")
+	if active["status"] != "scanning_ports" || active["target"] != "192.0.2.1" {
+		t.Fatalf("unexpected active progress: %#v", active)
+	}
+
+	failed := scanOutcomePayload("scanner", "instance", "failed", "discovery_timeout", "Scan failed", "Host discovery timed out")
+	if failed["status"] != "idle" || failed["outcome"] != "failed" {
+		t.Fatalf("terminal progress changed the v2 status contract: %#v", failed)
+	}
+	if failed["error_code"] != "discovery_timeout" || failed["message"] != "Scan failed" || failed["detail"] != "Host discovery timed out" {
+		t.Fatalf("terminal progress omitted error details: %#v", failed)
+	}
+}

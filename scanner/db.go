@@ -79,6 +79,26 @@ type ScannerIdentity struct {
 	UpdatedAt        string
 }
 
+func getKnownOpenPorts(db *sql.DB, mac string) ([]int, error) {
+	if mac == "" {
+		return nil, nil
+	}
+	rows, err := db.Query("SELECT port FROM ports WHERE mac = ? AND protocol = 'tcp' AND state = 'open' ORDER BY port", strings.ToUpper(mac))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ports []int
+	for rows.Next() {
+		var port int
+		if err := rows.Scan(&port); err != nil {
+			return nil, err
+		}
+		ports = append(ports, port)
+	}
+	return ports, rows.Err()
+}
+
 func columnExists(tx *sql.Tx, table string, column string) (bool, error) {
 	var exists int
 	query := fmt.Sprintf(

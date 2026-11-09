@@ -37,20 +37,20 @@ type PortResult struct {
 	IsAcknowledged bool   `json:"is_acknowledged"`
 }
 
-func generateFingerprint(hostname string, ports []Port) string {
+func generateFingerprint(hostname string, ports []ObservedPort) string {
 	var portStrings []string
 	for _, p := range ports {
-		if p.State.State != "open" {
+		if p.State != "open" {
 			continue
 		}
-		portStrings = append(portStrings, fmt.Sprintf("%d/%s", p.PortID, p.Protocol))
+		portStrings = append(portStrings, fmt.Sprintf("%d/%s", p.Port, p.Protocol))
 	}
 	sort.Strings(portStrings)
 	data := fmt.Sprintf("%s|%s", hostname, strings.Join(portStrings, ","))
 	return fmt.Sprintf("%x", sha256.Sum256([]byte(data)))
 }
 
-func ProcessScan(db *sql.DB, run *NmapRun) ([]ScanResult, error) {
+func ProcessScan(db *sql.DB, run EngineScanResult) ([]ScanResult, error) {
 	var results []ScanResult
 
 	log.Println("DEBUG: DB tx starting in ProcessScan")
@@ -63,28 +63,16 @@ func ProcessScan(db *sql.DB, run *NmapRun) ([]ScanResult, error) {
 
 	for _, host := range run.Hosts {
 		nowUTC := time.Now().UTC().Format("2006-01-02 15:04:05")
-		var mac, ip, hostname string
-		for _, addr := range host.Addresses {
-			if addr.AddrType == "mac" {
-				mac = strings.ToUpper(addr.Addr)
-			} else if addr.AddrType == "ipv4" {
-				ip = addr.Addr
-			}
-		}
-
-		if len(host.Hostnames) > 0 {
-			hostname = host.Hostnames[0].Name
-		}
+		mac := strings.ToUpper(host.MAC)
+		ip := host.IP
+		hostname := host.Hostname
 
 		if mac == "" {
 			continue
 		}
 
 		// Extract OS Info
-		var osInfo string
-		if len(host.OS.Matches) > 0 {
-			osInfo = host.OS.Matches[0].Name
-		}
+		osInfo := host.OS
 
 		fingerprint := generateFingerprint(hostname, host.Ports)
 		isRandomized := isLocallyAdministered(mac)
@@ -161,18 +149,22 @@ func ProcessScan(db *sql.DB, run *NmapRun) ([]ScanResult, error) {
 			res.IsNewHost = false
 			res.CustomName = customName.String
 			res.IsAcknowledged = acknowledged
-			if res.Hostname == "" {
+			if res.Hostname == "" && !host.ClearMissingMetadata {
 				res.Hostname = existingHostname.String
 			}
-			if res.OS == "" {
+			if res.OS == "" && !host.ClearMissingMetadata {
 				res.OS = existingOS.String
 			}
 			res.CreatedAt = createdAt.String
 			res.LastSeen = nowUTC
 			log.Printf("DEBUG: DB exec starting in ProcessScan (UPDATE hosts existing, mac: %s)", mac)
-			_, err = tx.Exec(`UPDATE hosts SET ip = ?, hostname = COALESCE(NULLIF(?, ''), hostname), fingerprint = ?, os_info = COALESCE(NULLIF(?, ''), os_info), last_seen = CURRENT_TIMESTAMP
-				WHERE mac = ?`,
-				ip, hostname, fingerprint, osInfo, mac)
+			if host.ClearMissingMetadata {
+				_, err = tx.Exec(`UPDATE hosts SET ip = ?, hostname = ?, fingerprint = ?, os_info = ?, last_seen = CURRENT_TIMESTAMP
+					WHERE mac = ?`, ip, hostname, fingerprint, osInfo, mac)
+			} else {
+				_, err = tx.Exec(`UPDATE hosts SET ip = ?, hostname = COALESCE(NULLIF(?, ''), hostname), fingerprint = ?, os_info = COALESCE(NULLIF(?, ''), os_info), last_seen = CURRENT_TIMESTAMP
+					WHERE mac = ?`, ip, hostname, fingerprint, osInfo, mac)
+			}
 			log.Printf("DEBUG: DB exec finished in ProcessScan (UPDATE hosts existing, mac: %s, err: %v)", mac, err)
 		}
 
@@ -213,7 +205,7 @@ func ProcessScan(db *sql.DB, run *NmapRun) ([]ScanResult, error) {
 			return nil, fmt.Errorf("close ports no longer observed for host %s: %w", mac, err)
 		}
 
-		// Process every explicit Nmap port state for history, but publish and
+		// Process every explicit engine port state for history, but publish and
 		// alert only exact open ports.
 		for _, p := range host.Ports {
 			var scriptData []string
@@ -223,16 +215,16 @@ func ProcessScan(db *sql.DB, run *NmapRun) ([]ScanResult, error) {
 			scripts := strings.Join(scriptData, "\n")
 
 			portRes := PortResult{
-				Port:     p.PortID,
+				Port:     p.Port,
 				Protocol: p.Protocol,
-				Service:  p.Service.Name,
-				State:    p.State.State,
+				Service:  p.Service,
+				State:    p.State,
 				Scripts:  scripts,
 			}
 
-			key := fmt.Sprintf("%d/%s", p.PortID, p.Protocol)
+			key := fmt.Sprintf("%d/%s", p.Port, p.Protocol)
 			previous, existed := knownPorts[key]
-			isOpen := p.State.State == "open"
+			isOpen := p.State == "open"
 			portRes.IsNew = isOpen && (!existed || previous.state != "open")
 			portRes.IsAcknowledged = existed && previous.acknowledged
 			if portRes.IsNew {
@@ -241,22 +233,22 @@ func ProcessScan(db *sql.DB, run *NmapRun) ([]ScanResult, error) {
 			}
 
 			if !existed {
-				log.Printf("DEBUG: DB exec starting in ProcessScan (INSERT ports new, mac: %s, port: %d)", mac, p.PortID)
+				log.Printf("DEBUG: DB exec starting in ProcessScan (INSERT ports new, mac: %s, port: %d)", mac, p.Port)
 				_, err = tx.Exec(`INSERT INTO ports (mac, port, protocol, service, state, script_data, acknowledged)
 					VALUES (?, ?, ?, ?, ?, ?, ?)`,
-					mac, p.PortID, p.Protocol, p.Service.Name, p.State.State, scripts, portRes.IsAcknowledged)
-				log.Printf("DEBUG: DB exec finished in ProcessScan (INSERT ports new, mac: %s, port: %d, err: %v)", mac, p.PortID, err)
+					mac, p.Port, p.Protocol, p.Service, p.State, scripts, portRes.IsAcknowledged)
+				log.Printf("DEBUG: DB exec finished in ProcessScan (INSERT ports new, mac: %s, port: %d, err: %v)", mac, p.Port, err)
 			} else {
-				log.Printf("DEBUG: DB exec starting in ProcessScan (UPDATE ports existing, mac: %s, port: %d)", mac, p.PortID)
+				log.Printf("DEBUG: DB exec starting in ProcessScan (UPDATE ports existing, mac: %s, port: %d)", mac, p.Port)
 				_, err = tx.Exec(`UPDATE ports SET service = ?, state = ?, script_data = ?,
 					acknowledged = ?, last_seen = CURRENT_TIMESTAMP
 					WHERE mac = ? AND port = ? AND protocol = ?`,
-					p.Service.Name, p.State.State, scripts, portRes.IsAcknowledged, mac, p.PortID, p.Protocol)
-				log.Printf("DEBUG: DB exec finished in ProcessScan (UPDATE ports existing, mac: %s, port: %d, err: %v)", mac, p.PortID, err)
+					p.Service, p.State, scripts, portRes.IsAcknowledged, mac, p.Port, p.Protocol)
+				log.Printf("DEBUG: DB exec finished in ProcessScan (UPDATE ports existing, mac: %s, port: %d, err: %v)", mac, p.Port, err)
 			}
 
 			if err != nil {
-				return nil, fmt.Errorf("failed to update port %d for host %s: %w", p.PortID, mac, err)
+				return nil, fmt.Errorf("failed to update port %d for host %s: %w", p.Port, mac, err)
 			}
 			if isOpen {
 				res.Ports = append(res.Ports, portRes)
@@ -287,7 +279,7 @@ func LatestScanMetrics(db *sql.DB) (string, time.Duration, error) {
 	var timestamp string
 	var durationSeconds int64
 	err := db.QueryRow(`SELECT timestamp, duration_seconds FROM scan_history
-		ORDER BY id DESC LIMIT 1`).Scan(&timestamp, &durationSeconds)
+		WHERE status = 'success' ORDER BY id DESC LIMIT 1`).Scan(&timestamp, &durationSeconds)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", 0, nil
 	}

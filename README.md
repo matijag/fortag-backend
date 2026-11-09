@@ -1,7 +1,7 @@
 # Fortag Backend
 
 Fortag Backend is a stateful local-network security scanner. It discovers hosts
-on private IPv4 networks, performs targeted Nmap service scans, stores history
+on private IPv4 networks, scans their TCP ports with its native engine, stores history
 in SQLite, and publishes state and commands through MQTT API v2.
 
 This repository contains the complete backend source, unit tests, integration
@@ -10,7 +10,9 @@ web panel are separate components.
 
 ## Features
 
-- Two-phase Nmap scanning: host discovery followed by per-host service scans.
+- Two-phase scanning: host discovery followed by explicit TCP `1-65535` scans.
+- Fortag-owned multiplexed TCP SYN scanning with global/per-host rate ceilings,
+  observed-port priority, and bounded CONNECT fallback.
 - Strict scan-target validation limited to RFC 1918 IPv4 networks.
 - SQLite schema migrations and durable device/port history.
 - Identity bridging for devices that rotate locally administered MAC addresses.
@@ -61,7 +63,9 @@ docker compose --env-file fortag.env up -d --build
 ```
 
 The database is stored in the named `fortag-data` volume. The scanner uses host
-networking because Nmap discovery needs direct access to the local network.
+networking because ARP discovery needs direct access to the local network.
+The Compose configuration grants `NET_RAW` for SYN scanning; if it is removed,
+Fortag logs the condition and falls back to TCP CONNECT scanning.
 
 Only scan networks you own or are explicitly authorized to assess.
 
@@ -83,6 +87,15 @@ If `-range` is omitted, Fortag detects a local RFC 1918 interface. A range can
 also be changed through MQTT. The scanner rejects public and boundary-crossing
 CIDRs.
 
+Each discovered host receives an explicit full TCP-port scan. This is broader
+and may take longer or generate more traffic than a selected-port scan. The
+default rate is deliberately conservative for home networks.
+
+The Nmap-free image does not provide OS guesses, MAC-vendor names, service
+product/version detection, CPEs, NSE output, traceroute metadata, or
+Nmap-derived hostnames. Those fields remain empty rather than being guessed or
+carried forward as fresh scan evidence.
+
 ## Tests
 
 Run unit tests in a container:
@@ -103,12 +116,13 @@ that broker configuration in production.
 
 ## Release image
 
-To build and push a multi-platform image, authenticate to your chosen registry
-and provide the full image name explicitly:
+To build and push a multi-platform image, authenticate to Docker Hub and
+provide the image name explicitly:
 
 ```bash
-IMAGE=ghcr.io/OWNER/fortag-backend ./build-and-push.sh beta 1.1.0-rc.2
-IMAGE=ghcr.io/OWNER/fortag-backend ./build-and-push.sh stable 1.1.0
+docker login
+IMAGE=matijag/fortag ./build-and-push.sh beta 1.1.0-rc.2
+IMAGE=matijag/fortag ./build-and-push.sh stable 1.1.0
 ```
 
 Beta builds publish the exact version and `beta`. Stable builds publish the

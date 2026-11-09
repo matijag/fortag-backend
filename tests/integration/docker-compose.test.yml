@@ -21,6 +21,8 @@ services:
       args:
         BUILD_VERSION: integration-test
     network_mode: host
+    cap_add:
+      - NET_RAW
     environment:
       - DB_PATH=/app/data/test.db
     tmpfs:

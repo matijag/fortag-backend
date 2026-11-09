@@ -3,6 +3,8 @@ set -eu
 
 mode="${1:-unit}"
 
+scanner/verify-native-image.sh fortag-native-runtime:tests scanner
+
 case "$mode" in
   unit)
     docker build --target builder -t fortag-backend-unit -f scanner/Dockerfile scanner

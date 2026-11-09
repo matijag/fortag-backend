@@ -6,7 +6,7 @@ version="${2:-}"
 image="${IMAGE:-}"
 
 if [[ -z "$image" || -z "$channel" || -z "$version" ]]; then
-  echo "Usage: IMAGE=registry.example/owner/fortag-backend $0 <beta|stable> <version>" >&2
+  echo "Usage: IMAGE=matijag/fortag $0 <beta|stable> <version>" >&2
   exit 2
 fi
 
@@ -42,6 +42,8 @@ fi
 
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
+  --sbom=true \
+  --provenance=mode=max \
   "${tags[@]}" \
   --build-arg "BUILD_VERSION=$version" \
   --push \

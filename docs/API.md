@@ -54,7 +54,7 @@ Publishes the full state of the network scan. This message is published with the
     }
     ```
 
-Only ports whose latest successful host scan reports exact Nmap state `open`
+Only ports whose latest successful host scan reports exact state `open`
 are included in scanner state. Closed and filtered observations remain in
 SQLite as history but are not published as current exposure. A transition from
 any non-open state back to `open` is emitted as a new, unacknowledged port
@@ -63,12 +63,19 @@ exposure.
 #### `fortag/scanner/progress`
 Publishes real-time scanning progress updates.
 
-*   **Trigger:** Transition between scanning phases (host discovery, targeted port scan, idle).
+*   **Trigger:** Transition between scanning phases or completion of a scan attempt.
+    MQTT API v2 publishes this retained at QoS 1. The `status` vocabulary stays
+    fixed for compatibility; optional outcome fields are additive.
 *   **JSON Schema:**
     ```json
     {
       "status": "string (scanning_hosts | scanning_ports | idle)",
-      "target": "string (subnet range or IP address being scanned)"
+      "target": "string (subnet range or IP address being scanned)",
+      "outcome": "optional string (success | partial | failed; present when status is idle)",
+      "error_code": "optional stable string for partial or failed outcomes",
+      "message": "optional short user-facing summary",
+      "detail": "optional sanitized user-facing explanation",
+      "updated_at": "RFC3339 timestamp"
     }
     ```
 
@@ -244,6 +251,12 @@ prevents a new scan from starting, but an already-running scan may finish locall
 The initial scanner name is the hostname when available, otherwise
 `Fortag <short UUID>`, and user changes are persisted in `scanner_identity`.
 
+MQTT API v2 progress keeps `status` limited to `idle`, `scanning_hosts`, and
+`scanning_ports`. A completed attempt may add `outcome`, `error_code`, `message`,
+and `detail`. Consumers must ignore unknown fields. `detail` is sanitized and
+must not contain raw command output, credentials, broker addresses, filesystem
+paths, or arbitrary network responses; technical errors remain in scanner logs.
+
 #### Home Assistant approval lease
 
 Retained discovery and instance-presence messages act as the scanner's
@@ -345,7 +358,11 @@ Fetches the cached network scanning state and progress.
         },
         "progress": {
           "status": "string",
-          "target": "string"
+          "target": "string",
+          "outcome": "optional string",
+          "error_code": "optional string",
+          "message": "optional string",
+          "detail": "optional string"
         }
       }
     }

@@ -57,6 +57,22 @@ func TestScannerEndToEnd(t *testing.T) {
 		t.Fatalf("Failed to connect to test MQTT: %v", token.Error())
 	}
 	defer client.Disconnect(250)
+	type progressMessage struct {
+		Status string
+		QoS    byte
+	}
+	progressChan := make(chan progressMessage, 16)
+	progressSubscription := client.Subscribe("fortag/scanners/+/progress", 1, func(c mqtt.Client, m mqtt.Message) {
+		var progress struct {
+			Status string `json:"status"`
+		}
+		if json.Unmarshal(m.Payload(), &progress) == nil {
+			progressChan <- progressMessage{Status: progress.Status, QoS: m.Qos()}
+		}
+	})
+	if progressSubscription.Wait() && progressSubscription.Error() != nil {
+		t.Fatalf("Could not subscribe to scan progress: %v", progressSubscription.Error())
+	}
 
 	// 3. Act as Home Assistant: adopt the first scanner instance and renew its
 	// approval lease so the scanner may publish state and begin scanning.
@@ -241,16 +257,19 @@ invalidRangeRejected:
 
 autoRangeCompleted:
 
-	// 6. Trigger Manual Scan
-	fmt.Println("Testing scan_now command...")
-	scanPayload, _ := json.Marshal(map[string]string{"command_id": uuid.NewString()})
-	client.Publish(fmt.Sprintf("fortag/scanners/%s/command/scan_now", scannerUUID), 1, false, scanPayload)
-
-	// Wait for a second state publication after the manual scan
-	select {
-	case <-stateChan:
-		fmt.Println("Received state after manual scan trigger")
-	case <-time.After(20 * time.Second):
-		t.Fatal("Timed out waiting for state after manual scan trigger")
+	// 6. Verify live scan progress without waiting for the full 65,535-port scan.
+	for {
+		select {
+		case progress := <-progressChan:
+			if progress.Status != "scanning_hosts" && progress.Status != "scanning_ports" {
+				continue
+			}
+			if progress.QoS != 1 {
+				t.Fatalf("Scan progress QoS = %d, want 1", progress.QoS)
+			}
+			return
+		case <-time.After(10 * time.Second):
+			t.Fatal("Timed out waiting for live scan progress")
+		}
 	}
 }

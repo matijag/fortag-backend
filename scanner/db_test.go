@@ -27,6 +27,37 @@ CREATE TABLE ports (
 );
 `
 
+func TestGetKnownOpenPortsReturnsOnlyOpenTCP(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(schema); err != nil {
+		t.Fatal(err)
+	}
+	mac := "00:11:22:33:44:55"
+	if _, err := db.Exec("INSERT INTO hosts (mac, ip) VALUES (?, ?)", mac, "192.168.1.5"); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range []struct {
+		port     int
+		protocol string
+		state    string
+	}{{49153, "tcp", "open"}, {53, "tcp", "open"}, {80, "tcp", "closed"}, {53, "udp", "open"}} {
+		if _, err := db.Exec("INSERT INTO ports (mac, port, protocol, state) VALUES (?, ?, ?, ?)", mac, row.port, row.protocol, row.state); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ports, err := getKnownOpenPorts(db, mac)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ports) != 2 || ports[0] != 53 || ports[1] != 49153 {
+		t.Fatalf("known ports = %v", ports)
+	}
+}
+
 func TestInitDBAdoptsUnversionedLegacyDatabase(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "legacy.db")
 	legacyDB, err := sql.Open("sqlite", dbPath)

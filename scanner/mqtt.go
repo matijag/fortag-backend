@@ -441,14 +441,44 @@ func (m *MQTTClient) PublishState(results []ScanResult, lastScan string, duratio
 }
 
 func (m *MQTTClient) PublishProgress(status, target string) {
-	payload := map[string]any{
-		"scanner_uuid": m.scannerUUID,
-		"instance_id":  m.instanceID,
+	m.publishProgress(progressPayload(m.scannerUUID, m.instanceID, status, target))
+}
+
+func progressPayload(scannerUUID, instanceID, status, target string) map[string]any {
+	return map[string]any{
+		"scanner_uuid": scannerUUID,
+		"instance_id":  instanceID,
 		"status":       status,
 		"target":       target,
 		"updated_at":   time.Now().UTC().Format(time.RFC3339),
 	}
-	if err := m.publish(m.scannerTopic("progress"), 0, true, payload); err != nil {
+}
+
+func (m *MQTTClient) PublishScanOutcome(outcome, errorCode, message, detail string) {
+	m.publishProgress(scanOutcomePayload(m.scannerUUID, m.instanceID, outcome, errorCode, message, detail))
+}
+
+func scanOutcomePayload(scannerUUID, instanceID, outcome, errorCode, message, detail string) map[string]any {
+	payload := map[string]any{
+		"scanner_uuid": scannerUUID,
+		"instance_id":  instanceID,
+		"status":       "idle",
+		"target":       "",
+		"outcome":      outcome,
+		"message":      message,
+		"updated_at":   time.Now().UTC().Format(time.RFC3339),
+	}
+	if errorCode != "" {
+		payload["error_code"] = errorCode
+	}
+	if detail != "" {
+		payload["detail"] = detail
+	}
+	return payload
+}
+
+func (m *MQTTClient) publishProgress(payload map[string]any) {
+	if err := m.publish(m.scannerTopic("progress"), 1, true, payload); err != nil {
 		log.Printf("ERROR: Publish progress: %v", err)
 	}
 }
