@@ -35,7 +35,7 @@ func TestPruneCommandCacheExpiresAndBoundsEntries(t *testing.T) {
 	}
 }
 
-func TestProgressPayloadsRemainCompatibleWithAPIVersion2(t *testing.T) {
+func TestProgressPayloadsRetainUserFacingStatusInAPIVersion3(t *testing.T) {
 	active := progressPayload("scanner", "instance", "scanning_ports", "192.0.2.1")
 	if active["status"] != "scanning_ports" || active["target"] != "192.0.2.1" {
 		t.Fatalf("unexpected active progress: %#v", active)
@@ -43,7 +43,7 @@ func TestProgressPayloadsRemainCompatibleWithAPIVersion2(t *testing.T) {
 
 	failed := scanOutcomePayload("scanner", "instance", "failed", "discovery_timeout", "Scan failed", "Host discovery timed out")
 	if failed["status"] != "idle" || failed["outcome"] != "failed" {
-		t.Fatalf("terminal progress changed the v2 status contract: %#v", failed)
+		t.Fatalf("terminal progress changed the user-facing status contract: %#v", failed)
 	}
 	if failed["error_code"] != "discovery_timeout" || failed["message"] != "Scan failed" || failed["detail"] != "Host discovery timed out" {
 		t.Fatalf("terminal progress omitted error details: %#v", failed)

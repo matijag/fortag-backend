@@ -129,14 +129,14 @@ func TestScannerEndToEnd(t *testing.T) {
 		if err := json.Unmarshal(payload, &state); err != nil {
 			t.Fatalf("Invalid JSON in state: %v", err)
 		}
-		if state["api_version"] != float64(2) {
+		if state["api_version"] != float64(3) {
 			t.Fatalf("Unexpected MQTT API version: %v", state["api_version"])
 		}
 		if state["scanner_version"] != "integration-test" {
 			t.Fatalf("Initial state has scanner version %v, want integration-test", state["scanner_version"])
 		}
-		if state["schema_version"] != float64(2) {
-			t.Fatalf("Initial state has schema version %v, want 2", state["schema_version"])
+		if state["schema_version"] != float64(4) {
+			t.Fatalf("Initial state has schema version %v, want 4", state["schema_version"])
 		}
 		if state["scanner_uuid"] != scannerUUID {
 			t.Fatalf("Initial state scanner UUID = %v, want %s", state["scanner_uuid"], scannerUUID)

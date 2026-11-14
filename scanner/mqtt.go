@@ -16,10 +16,13 @@ import (
 )
 
 const (
-	presenceInterval     = 15 * time.Second
-	defaultApprovalLease = 60 * time.Second
-	commandCacheLimit    = 1000
-	commandCacheTTL      = 24 * time.Hour
+	presenceInterval      = 15 * time.Second
+	defaultApprovalLease  = 60 * time.Second
+	commandCacheLimit     = 1000
+	commandCacheTTL       = 24 * time.Hour
+	configSchemaVersion   = 1
+	progressSchemaVersion = 1
+	maxDesiredConfigBytes = 16 * 1024
 )
 
 var ErrScannerUUIDCollision = errors.New("scanner UUID is already active")
@@ -55,9 +58,13 @@ type MQTTClient struct {
 	backoff      time.Duration
 	connectedAt  time.Time
 
-	cacheMu      sync.Mutex
-	commandCache map[string]commandCacheEntry
-	metadataMu   sync.RWMutex
+	cacheMu           sync.Mutex
+	commandCache      map[string]commandCacheEntry
+	metadataMu        sync.RWMutex
+	progressMu        sync.RWMutex
+	progressRevision  atomic.Uint64
+	schedulerSnapshot SchedulerSnapshot
+	lastOutcome       map[string]any
 
 	stop chan struct{}
 	done chan struct{}
@@ -156,13 +163,17 @@ func (m *MQTTClient) presencePayload(status string) string {
 	scanRange := m.scanRange
 	m.metadataMu.RUnlock()
 	payload, _ := json.Marshal(map[string]any{
-		"scanner_uuid":  m.scannerUUID,
-		"instance_id":   m.instanceID,
-		"scanner_name":  scannerName,
-		"scan_range":    scanRange,
-		"registered_at": m.startedAt.Format(time.RFC3339),
-		"updated_at":    time.Now().UTC().Format(time.RFC3339),
-		"status":        status,
+		"scanner_uuid":    m.scannerUUID,
+		"instance_id":     m.instanceID,
+		"scanner_name":    scannerName,
+		"scan_range":      scanRange,
+		"registered_at":   m.startedAt.Format(time.RFC3339),
+		"updated_at":      time.Now().UTC().Format(time.RFC3339),
+		"status":          status,
+		"api_version":     mqttAPIVersion,
+		"config_schema":   configSchemaVersion,
+		"progress_schema": progressSchemaVersion,
+		"capabilities":    []string{"identity_observations", "mdns", "ssdp", "targeted_scans", "scheduler_progress"},
 	})
 	return string(payload)
 }
@@ -250,6 +261,9 @@ func (m *MQTTClient) publishRegistration() error {
 		"scanner_version": scannerVersion,
 		"api_version":     mqttAPIVersion,
 		"scan_range":      scanRange,
+		"config_schema":   configSchemaVersion,
+		"progress_schema": progressSchemaVersion,
+		"capabilities":    []string{"identity_observations", "mdns", "ssdp", "targeted_scans", "scheduler_progress"},
 	}
 	if err := m.publish(fmt.Sprintf("fortag/discovery/%s/info", m.scannerUUID), 1, true, info); err != nil {
 		return err
@@ -427,21 +441,115 @@ func (m *MQTTClient) PublishState(results []ScanResult, lastScan string, duratio
 		"scan_range":      scanRange,
 		"hosts":           results,
 	}
-	config := map[string]any{
-		"scanner_uuid": m.scannerUUID,
-		"instance_id":  m.instanceID,
-		"scanner_name": scannerName,
-		"scan_range":   scanRange,
-		"updated_at":   time.Now().UTC().Format(time.RFC3339),
-	}
-	if err := m.publish(m.scannerTopic("reported/config"), 1, true, config); err != nil {
-		return err
-	}
 	return m.publish(m.scannerTopic("state"), 0, true, payload)
+}
+
+type desiredScannerConfig struct {
+	SchemaVersion          int             `json:"schema_version"`
+	ScannerUUID            string          `json:"scanner_uuid"`
+	Revision               string          `json:"revision"`
+	Collectors             map[string]bool `json:"collectors"`
+	AutomaticTargetedScans map[string]bool `json:"automatic_targeted_scans"`
+	Unsupported            []string        `json:"-"`
+}
+
+func (m *MQTTClient) SubscribeDesiredConfig(apply func(desiredScannerConfig) error) error {
+	topic := m.scannerTopic("desired/config")
+	token := m.client.Subscribe(topic, 1, func(_ mqtt.Client, msg mqtt.Message) {
+		if len(msg.Payload()) > maxDesiredConfigBytes {
+			log.Printf("ERROR: Desired config exceeds %d bytes", maxDesiredConfigBytes)
+			return
+		}
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(msg.Payload(), &raw); err != nil {
+			log.Printf("ERROR: Invalid desired config JSON: %v", err)
+			return
+		}
+		var config desiredScannerConfig
+		if err := json.Unmarshal(msg.Payload(), &config); err != nil {
+			log.Printf("ERROR: Invalid desired config field type: %v", err)
+			return
+		}
+		known := map[string]bool{
+			"schema_version": true, "scanner_uuid": true, "revision": true,
+			"collectors": true, "automatic_targeted_scans": true, "updated_at": true,
+		}
+		for name := range raw {
+			if !known[name] {
+				config.Unsupported = append(config.Unsupported, name)
+			}
+		}
+		if config.SchemaVersion != configSchemaVersion || config.ScannerUUID != m.scannerUUID {
+			log.Printf("ERROR: Desired config identity or schema does not match this scanner")
+			return
+		}
+		if _, err := uuid.Parse(config.Revision); err != nil {
+			log.Printf("ERROR: Desired config revision is invalid")
+			return
+		}
+		if err := apply(config); err != nil {
+			log.Printf("ERROR: Desired config was rejected: %v", err)
+		}
+	})
+	token.Wait()
+	return token.Error()
+}
+
+func (m *MQTTClient) PublishReportedConfig(revision string, effective map[string]bool, health map[string]collectorHealth, configErrors map[string]string, unsupported []string) error {
+	if configErrors == nil {
+		configErrors = map[string]string{}
+	}
+	if unsupported == nil {
+		unsupported = []string{}
+	}
+	payload := map[string]any{
+		"schema_version":   configSchemaVersion,
+		"scanner_uuid":     m.scannerUUID,
+		"instance_id":      m.instanceID,
+		"revision":         revision,
+		"effective":        map[string]any{"collectors": effective},
+		"collector_health": health,
+		"errors":           configErrors,
+		"unsupported":      unsupported,
+		"updated_at":       time.Now().UTC().Format(time.RFC3339),
+	}
+	return m.publish(m.scannerTopic("reported/config"), 1, true, payload)
 }
 
 func (m *MQTTClient) PublishProgress(status, target string) {
 	m.publishProgress(progressPayload(m.scannerUUID, m.instanceID, status, target))
+}
+
+func (m *MQTTClient) PublishSchedulerSnapshot(snapshot SchedulerSnapshot) {
+	m.progressMu.Lock()
+	m.schedulerSnapshot = snapshot
+	if snapshot.Active != nil {
+		m.lastOutcome = nil
+	}
+	lastOutcome := make(map[string]any, len(m.lastOutcome))
+	for key, value := range m.lastOutcome {
+		lastOutcome[key] = value
+	}
+	m.progressMu.Unlock()
+	status := "idle"
+	target := ""
+	if snapshot.Active != nil {
+		if snapshot.Active.Kind == ScanJobRoutine {
+			status = "scanning_hosts"
+		} else {
+			status = "scanning_ports"
+			target = snapshot.Active.IP
+		}
+	} else if len(snapshot.Queue) > 0 {
+		status = "queued"
+	}
+	payload := progressPayload(m.scannerUUID, m.instanceID, status, target)
+	if snapshot.Active == nil && len(snapshot.Queue) == 0 {
+		for key, value := range lastOutcome {
+			payload[key] = value
+		}
+	}
+	m.publishProgress(payload)
 }
 
 func progressPayload(scannerUUID, instanceID, status, target string) map[string]any {
@@ -455,7 +563,17 @@ func progressPayload(scannerUUID, instanceID, status, target string) map[string]
 }
 
 func (m *MQTTClient) PublishScanOutcome(outcome, errorCode, message, detail string) {
-	m.publishProgress(scanOutcomePayload(m.scannerUUID, m.instanceID, outcome, errorCode, message, detail))
+	payload := scanOutcomePayload(m.scannerUUID, m.instanceID, outcome, errorCode, message, detail)
+	m.progressMu.Lock()
+	m.lastOutcome = map[string]any{"outcome": outcome, "message": message}
+	if errorCode != "" {
+		m.lastOutcome["error_code"] = errorCode
+	}
+	if detail != "" {
+		m.lastOutcome["detail"] = detail
+	}
+	m.progressMu.Unlock()
+	m.publishProgress(payload)
 }
 
 func scanOutcomePayload(scannerUUID, instanceID, outcome, errorCode, message, detail string) map[string]any {
@@ -478,6 +596,14 @@ func scanOutcomePayload(scannerUUID, instanceID, outcome, errorCode, message, de
 }
 
 func (m *MQTTClient) publishProgress(payload map[string]any) {
+	payload["api_version"] = mqttAPIVersion
+	payload["schema_version"] = progressSchemaVersion
+	payload["revision"] = m.progressRevision.Add(1)
+	m.progressMu.RLock()
+	payload["active_job"] = m.schedulerSnapshot.Active
+	queue := append([]ScanJob(nil), m.schedulerSnapshot.Queue...)
+	m.progressMu.RUnlock()
+	payload["queue"] = queue
 	if err := m.publish(m.scannerTopic("progress"), 1, true, payload); err != nil {
 		log.Printf("ERROR: Publish progress: %v", err)
 	}
@@ -494,6 +620,10 @@ func (m *MQTTClient) PublishAlert(alertType, mac string, extra map[string]any) {
 }
 
 func (m *MQTTClient) publishCommandResult(commandID, command, status, errorCode, message string) []byte {
+	return m.publishCommandResultWithDetails(commandID, command, status, errorCode, message, nil)
+}
+
+func (m *MQTTClient) publishCommandResultWithDetails(commandID, command, status, errorCode, message string, details map[string]any) []byte {
 	payload := map[string]any{
 		"command_id": commandID,
 		"command":    command,
@@ -503,6 +633,9 @@ func (m *MQTTClient) publishCommandResult(commandID, command, status, errorCode,
 	}
 	if errorCode != "" {
 		payload["error_code"] = errorCode
+	}
+	if len(details) > 0 {
+		payload["details"] = details
 	}
 	data, _ := json.Marshal(payload)
 	if err := m.publish(m.scannerTopic("command/result"), 1, false, data); err != nil {
@@ -529,7 +662,7 @@ func (m *MQTTClient) pruneCommandCache(now time.Time) {
 	}
 }
 
-func (m *MQTTClient) handleCommand(command string, msg mqtt.Message, execute func(map[string]any) error) {
+func (m *MQTTClient) handleCommand(command string, msg mqtt.Message, execute func(map[string]any) (map[string]any, error)) {
 	var request map[string]any
 	if err := json.Unmarshal(msg.Payload(), &request); err != nil {
 		m.publishCommandResult("", command, "rejected", "invalid_json", "Command payload is not valid JSON")
@@ -570,10 +703,11 @@ func (m *MQTTClient) handleCommand(command string, msg mqtt.Message, execute fun
 	m.cacheMu.Unlock()
 
 	status, errorCode, message := "completed", "", "Command completed"
-	if err := execute(request); err != nil {
-		status, errorCode, message = "failed", "command_failed", err.Error()
+	details, executeErr := execute(request)
+	if executeErr != nil {
+		status, errorCode, message = "failed", "command_failed", executeErr.Error()
 	}
-	terminal := m.publishCommandResult(commandID, command, status, errorCode, message)
+	terminal := m.publishCommandResultWithDetails(commandID, command, status, errorCode, message, details)
 	m.cacheMu.Lock()
 	entry = m.commandCache[commandID]
 	entry.result = terminal
@@ -587,28 +721,38 @@ func (m *MQTTClient) SubscribeCommands(
 	onAck func(mac string, port int, proto string) error,
 	onSetRange func(newRange string) error,
 	onScanNow func() error,
+	onScanTarget func(mac, ip string) (ScanJob, error),
 ) error {
-	subscriptions := map[string]func(map[string]any) error{
-		"rename_scanner": func(request map[string]any) error {
+	subscriptions := map[string]func(map[string]any) (map[string]any, error){
+		"rename_scanner": func(request map[string]any) (map[string]any, error) {
 			name, _ := request["name"].(string)
-			return onRenameScanner(name)
+			return nil, onRenameScanner(name)
 		},
-		"rename": func(request map[string]any) error {
+		"rename": func(request map[string]any) (map[string]any, error) {
 			mac, _ := request["mac"].(string)
 			name, _ := request["name"].(string)
-			return onRename(mac, name)
+			return nil, onRename(mac, name)
 		},
-		"acknowledge": func(request map[string]any) error {
+		"acknowledge": func(request map[string]any) (map[string]any, error) {
 			mac, _ := request["mac"].(string)
 			port, _ := request["port"].(float64)
 			proto, _ := request["protocol"].(string)
-			return onAck(mac, int(port), proto)
+			return nil, onAck(mac, int(port), proto)
 		},
-		"set_range": func(request map[string]any) error {
+		"set_range": func(request map[string]any) (map[string]any, error) {
 			rangeValue, _ := request["range"].(string)
-			return onSetRange(rangeValue)
+			return nil, onSetRange(rangeValue)
 		},
-		"scan_now": func(map[string]any) error { return onScanNow() },
+		"scan_now": func(map[string]any) (map[string]any, error) { return nil, onScanNow() },
+		"scan_target": func(request map[string]any) (map[string]any, error) {
+			mac, _ := request["mac"].(string)
+			ip, _ := request["ip"].(string)
+			job, err := onScanTarget(mac, ip)
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{"job_id": job.ID, "queue_position": job.QueuePosition}, nil
+		},
 	}
 	for command, execute := range subscriptions {
 		command, execute := command, execute

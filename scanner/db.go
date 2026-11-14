@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS config (
 );
 `
 
-const currentSchemaVersion = 2
+const currentSchemaVersion = 4
 
 const scannerIdentitySchema = `
 CREATE TABLE scanner_identity (
@@ -68,6 +68,48 @@ CREATE TABLE scanner_identity (
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );`
+
+const identityObservationSchema = `
+CREATE TABLE identity_observations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mac TEXT NOT NULL,
+    source TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    normalized_value TEXT NOT NULL,
+    display_value TEXT NOT NULL,
+    confidence INTEGER NOT NULL CHECK (confidence BETWEEN 0 AND 100),
+    stability TEXT NOT NULL CHECK (stability IN ('stable', 'transient')),
+    evidence_json TEXT,
+    observed_address TEXT,
+    collection_run TEXT,
+    first_seen DATETIME NOT NULL,
+    last_seen DATETIME NOT NULL,
+    expires_at DATETIME,
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    FOREIGN KEY (mac) REFERENCES hosts(mac) ON DELETE CASCADE,
+    UNIQUE(mac, source, kind, normalized_value)
+);
+CREATE INDEX identity_observations_active_host
+    ON identity_observations(mac, active, expires_at, kind, source);`
+
+const pendingIdentityObservationSchema = `
+CREATE TABLE pending_identity_observations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    observed_address TEXT NOT NULL,
+    source TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    normalized_value TEXT NOT NULL,
+    display_value TEXT NOT NULL,
+    confidence INTEGER NOT NULL CHECK (confidence BETWEEN 0 AND 100),
+    evidence_json TEXT,
+    collection_run TEXT,
+    first_seen DATETIME NOT NULL,
+    last_seen DATETIME NOT NULL,
+    expires_at DATETIME NOT NULL,
+    UNIQUE(observed_address, source, kind, normalized_value)
+);
+CREATE INDEX pending_identity_observations_address
+    ON pending_identity_observations(observed_address, expires_at);`
 
 type ScannerIdentity struct {
 	UUID             string
@@ -187,6 +229,57 @@ func migrateToVersion2(tx *sql.Tx) error {
 	return nil
 }
 
+func migrateToVersion3(tx *sql.Tx) error {
+	if _, err := tx.Exec(identityObservationSchema); err != nil {
+		return fmt.Errorf("create identity observations: %w", err)
+	}
+	rows, err := tx.Query(`SELECT mac, hostname,
+		COALESCE(created_at, last_seen, CURRENT_TIMESTAMP),
+		COALESCE(last_seen, CURRENT_TIMESTAMP)
+		FROM hosts WHERE trim(COALESCE(hostname, '')) != ''`)
+	if err != nil {
+		return fmt.Errorf("read legacy hostnames: %w", err)
+	}
+	type legacyHostname struct{ mac, normalized, display, firstSeen, lastSeen string }
+	var hostnames []legacyHostname
+	for rows.Next() {
+		var mac, hostname, firstSeen, lastSeen string
+		if err := rows.Scan(&mac, &hostname, &firstSeen, &lastSeen); err != nil {
+			rows.Close()
+			return fmt.Errorf("read legacy hostname: %w", err)
+		}
+		normalized, display, err := normalizeIdentityValue(hostname)
+		if err == nil {
+			hostnames = append(hostnames, legacyHostname{mac, normalized, display, firstSeen, lastSeen})
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close legacy hostname rows: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("read legacy hostnames: %w", err)
+	}
+	for _, hostname := range hostnames {
+		if _, err := tx.Exec(`INSERT INTO identity_observations (
+			mac, source, kind, normalized_value, display_value, confidence,
+			stability, first_seen, last_seen, expires_at, active
+		) VALUES (?, 'nmap', 'hostname', ?, ?, 50, 'transient', ?, ?,
+			datetime(?, '+30 days'), 1)`, hostname.mac, hostname.normalized,
+			hostname.display, hostname.firstSeen, hostname.lastSeen,
+			hostname.lastSeen); err != nil {
+			return fmt.Errorf("seed legacy hostname observation: %w", err)
+		}
+	}
+	return nil
+}
+
+func migrateToVersion4(tx *sql.Tx) error {
+	if _, err := tx.Exec(pendingIdentityObservationSchema); err != nil {
+		return fmt.Errorf("create pending identity observations: %w", err)
+	}
+	return nil
+}
+
 func getScannerIdentity(db *sql.DB) (ScannerIdentity, error) {
 	var identity ScannerIdentity
 	err := db.QueryRow(`SELECT scanner_uuid, scanner_name, previous_uuid,
@@ -290,6 +383,28 @@ func migrateSchema(db *sql.DB) error {
 		}
 		if _, err := tx.Exec("PRAGMA user_version = 2"); err != nil {
 			return fmt.Errorf("record schema version 2: %w", err)
+		}
+		version = 2
+	}
+
+	if version < 3 {
+		log.Println("Migrating database schema from version 2 to 3")
+		if err := migrateToVersion3(tx); err != nil {
+			return fmt.Errorf("migrate schema from version 2 to 3: %w", err)
+		}
+		if _, err := tx.Exec("PRAGMA user_version = 3"); err != nil {
+			return fmt.Errorf("record schema version 3: %w", err)
+		}
+		version = 3
+	}
+
+	if version < 4 {
+		log.Println("Migrating database schema from version 3 to 4")
+		if err := migrateToVersion4(tx); err != nil {
+			return fmt.Errorf("migrate schema from version 3 to 4: %w", err)
+		}
+		if _, err := tx.Exec("PRAGMA user_version = 4"); err != nil {
+			return fmt.Errorf("record schema version 4: %w", err)
 		}
 	}
 

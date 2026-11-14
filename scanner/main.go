@@ -18,7 +18,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const mqttAPIVersion = 2
+const mqttAPIVersion = 3
 
 // scannerVersion is set at build time with -ldflags. Local builds report "dev".
 var scannerVersion = "dev"
@@ -187,6 +187,16 @@ func getAllScanResults(db *sql.DB) ([]ScanResult, error) {
 		r.OS = osi.String
 		r.CreatedAt = createdAt.String
 		r.LastSeen = lastSeen.String
+		selected, identityErr := selectDisplayIdentity(db, r.MAC, time.Now().UTC())
+		if identityErr != nil {
+			return nil, fmt.Errorf("select display identity for %s: %w", r.MAC, identityErr)
+		}
+		r.DisplayName = selected.Value
+		r.DisplaySource = selected.Source
+		r.Identity, identityErr = activeIdentitySummaries(db, r.MAC, time.Now().UTC())
+		if identityErr != nil {
+			return nil, fmt.Errorf("read identity observations for %s: %w", r.MAC, identityErr)
+		}
 
 		// Get ports
 		log.Printf("DEBUG: DB query starting in getAllScanResults (SELECT ports for MAC: %s)", r.MAC)
@@ -323,7 +333,6 @@ func main() {
 	defer mqttClient.Close()
 	log.Printf("Home Assistant approved scanner %s instance %s", identity.UUID, instanceID)
 
-	var scanInProgress atomic.Bool
 	var scanEngine ScanEngine = NewNativeEngine()
 
 	publishCurrentState := func() error {
@@ -356,16 +365,11 @@ func main() {
 		}
 	}()
 
-	doScan := func() {
+	doRoutineScan := func(ctx context.Context, _ ScanJob) error {
 		if !mqttClient.HasApproval() {
 			log.Println("Scan not started: MQTT connection or Home Assistant approval is unavailable.")
-			return
+			return ErrApprovalRequired
 		}
-		if !scanInProgress.CompareAndSwap(false, true) {
-			log.Println("Scan already in progress, skipping trigger.")
-			return
-		}
-		defer scanInProgress.Store(false)
 
 		startTime := time.Now()
 		rangeToScan, err := getCurrentRange(db, fallbackRange.Load().(string))
@@ -378,12 +382,12 @@ func main() {
 				"failed", "invalid_scan_range", "Scan could not start",
 				"The configured scan range is invalid or unavailable.",
 			)
-			return
+			return err
 		}
 		log.Printf("Starting phased scan of %s", rangeToScan)
 
 		mqttClient.PublishProgress("scanning_hosts", rangeToScan)
-		discovery, err := scanEngine.Discover(context.Background(), DiscoveryRequest{Target: rangeToScan})
+		discovery, err := scanEngine.Discover(ctx, DiscoveryRequest{Target: rangeToScan})
 		if err != nil {
 			log.Printf("Discovery failed: %v", err)
 			duration := time.Since(startTime)
@@ -392,7 +396,7 @@ func main() {
 			}
 			failure := safeScanFailure("discovery", err)
 			mqttClient.PublishScanOutcome("failed", failure.code, failure.message, failure.detail)
-			return
+			return err
 		}
 
 		log.Printf("Found %d up hosts. Starting targeted deep scans with %s...", len(discovery.Targets), scanEngine.Name())
@@ -448,12 +452,12 @@ func main() {
 					},
 				})
 			}
-			engineResult, scanErr := batchEngine.ScanBatch(context.Background(), requests)
+			engineResult, scanErr := batchEngine.ScanBatch(ctx, requests)
 			processResult("discovered hosts", engineResult, scanErr)
 		} else {
 			for _, ip := range discovery.Targets {
 				mqttClient.PublishProgress("scanning_ports", ip)
-				engineResult, scanErr := scanEngine.Scan(context.Background(), PortScanRequest{Target: ip, MAC: discoveredMACs[ip]})
+				engineResult, scanErr := scanEngine.Scan(ctx, PortScanRequest{Target: ip, MAC: discoveredMACs[ip]})
 				processResult(ip, engineResult, scanErr)
 			}
 		}
@@ -499,7 +503,109 @@ func main() {
 		} else {
 			mqttClient.PublishScanOutcome("success", "", "Scan completed successfully", "")
 		}
+		return nil
 	}
+
+	doTargetedScan := func(ctx context.Context, job ScanJob) error {
+		if !mqttClient.HasApproval() {
+			return ErrApprovalRequired
+		}
+		mac := job.MAC
+		if mac == "" {
+			if err := db.QueryRow("SELECT mac FROM hosts WHERE ip = ? ORDER BY last_seen DESC LIMIT 1", job.IP).Scan(&mac); err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("resolve targeted host MAC: %w", err)
+			}
+		}
+		priorityPorts, err := getKnownOpenPorts(db, mac)
+		if err != nil {
+			return fmt.Errorf("read targeted host port history: %w", err)
+		}
+		mqttClient.PublishProgress("scanning_ports", job.IP)
+		result, err := scanEngine.Scan(ctx, PortScanRequest{
+			Target: job.IP, MAC: mac, PriorityPorts: priorityPorts,
+			Progress: func(progress EngineProgress) {
+				mqttClient.PublishProgress("scanning_ports", progress.Target)
+			},
+		})
+		if err != nil {
+			failure := safeScanFailure("port_scan", err)
+			mqttClient.PublishScanOutcome("failed", failure.code, failure.message, failure.detail)
+			return err
+		}
+		processed, err := ProcessScan(db, result)
+		if err != nil {
+			mqttClient.PublishScanOutcome("failed", "database_write_failed", "Scan results could not be saved", "The scanner database rejected the targeted result update.")
+			return err
+		}
+		for _, alert := range securityAlerts(processed) {
+			mqttClient.PublishAlert(alert.alertType, alert.mac, alert.extra)
+		}
+		if err := publishCurrentState(); err != nil {
+			mqttClient.PublishScanOutcome("partial", "state_publish_failed", "Updated results could not be published", "Home Assistant may continue showing older results for this host.")
+			return err
+		}
+		mqttClient.PublishScanOutcome("success", "", "Targeted scan completed successfully", "")
+		return nil
+	}
+
+	validateTarget := func(target string) error {
+		scanRange, err := getCurrentRange(db, fallbackRange.Load().(string))
+		if err != nil {
+			return err
+		}
+		return targetWithinRange(target, scanRange)
+	}
+	scheduler := NewScanScheduler(mqttClient.HasApproval, validateTarget, func(ctx context.Context, job ScanJob) error {
+		var err error
+		if job.Kind == ScanJobTargeted {
+			err = doTargetedScan(ctx, job)
+		} else {
+			err = doRoutineScan(ctx, job)
+		}
+		if err != nil {
+			log.Printf("Scan job %s (%s) finished with error: %v", job.ID, job.Kind, err)
+		}
+		return err
+	})
+	scheduler.SetObserver(mqttClient.PublishSchedulerSnapshot)
+	scheduler.Start()
+	defer scheduler.Stop()
+
+	var collectorRevision atomic.Value
+	collectorRevision.Store("")
+	var collectors *identityCollectorManager
+	publishCollectorState := func() {
+		if err := publishCurrentState(); err != nil {
+			log.Printf("ERROR: Publish state after identity collection: %v", err)
+		}
+		if err := mqttClient.PublishReportedConfig(
+			collectorRevision.Load().(string), collectors.Effective(), collectors.Health(), nil, nil,
+		); err != nil {
+			log.Printf("ERROR: Publish collector configuration: %v", err)
+		}
+	}
+	collectors = newIdentityCollectorManager(db, func() (string, error) {
+		return getCurrentRange(db, fallbackRange.Load().(string))
+	}, publishCollectorState)
+	if err := mqttClient.SubscribeDesiredConfig(func(config desiredScannerConfig) error {
+		unsupported := append([]string(nil), config.Unsupported...)
+		for name, enabled := range config.Collectors {
+			if err := collectors.SetEnabled(name, enabled); err != nil {
+				unsupported = append(unsupported, name)
+			}
+		}
+		for source, enabled := range config.AutomaticTargetedScans {
+			if enabled || (source != "dhcp" && source != "ipv6_ndp") {
+				unsupported = append(unsupported, "automatic_targeted_scans."+source)
+			}
+		}
+		collectorRevision.Store(config.Revision)
+		return mqttClient.PublishReportedConfig(config.Revision, collectors.Effective(), collectors.Health(), nil, unsupported)
+	}); err != nil {
+		log.Fatalf("Subscribe to desired scanner configuration: %v", err)
+	}
+	collectors.Start(context.Background())
+	defer collectors.Stop()
 
 	onRename := func(mac, name string) error {
 		mac = strings.ToUpper(mac)
@@ -574,23 +680,15 @@ func main() {
 		return nil
 	}
 
-	triggerScan := make(chan bool, 1)
 	onScanNow := func() error {
-		if !mqttClient.HasApproval() {
-			return errors.New("MQTT connection or Home Assistant approval is unavailable")
-		}
-		if scanInProgress.Load() {
-			return errors.New("scan already in progress")
-		}
-		select {
-		case triggerScan <- true:
-			return nil
-		default:
-			return errors.New("scan trigger is already queued")
-		}
+		_, err := scheduler.EnqueueRoutine()
+		return err
+	}
+	onScanTarget := func(mac, ip string) (ScanJob, error) {
+		return scheduler.EnqueueTarget(mac, ip, "user")
 	}
 
-	if err := mqttClient.SubscribeCommands(onRename, onRenameScanner, onAck, onSetRange, onScanNow); err != nil {
+	if err := mqttClient.SubscribeCommands(onRename, onRenameScanner, onAck, onSetRange, onScanNow, onScanTarget); err != nil {
 		log.Fatalf("Subscribe to scanner commands: %v", err)
 	}
 
@@ -607,16 +705,18 @@ func main() {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 
-	go doScan()
+	if _, err := scheduler.EnqueueRoutine(); err != nil {
+		log.Printf("Initial scan was not queued: %v", err)
+	}
 
 	for {
 		select {
 		case <-stop:
 			return
 		case <-ticker.C:
-			go doScan()
-		case <-triggerScan:
-			go doScan()
+			if _, err := scheduler.EnqueueRoutine(); err != nil && !errors.Is(err, ErrRoutineQueued) {
+				log.Printf("Scheduled scan was not queued: %v", err)
+			}
 		}
 	}
 }

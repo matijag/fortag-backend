@@ -6,7 +6,10 @@ This document defines the communication APIs and payload schemas for the Fortag 
 
 ## 1. MQTT API Reference
 
-All MQTT messages use JSON payloads (except `scan_now` which is empty). The default topic prefix is `fortag/scanner`.
+All MQTT messages use JSON payloads. Sections 1.1 and 1.2 preserve the legacy
+v1 topic reference for migration context; the UUID-scoped namespace and MQTT
+API v3 contract below are normative for current releases. V3 commands include
+a JSON `command_id`, including `scan_now`.
 
 ### 1.1. Outbound Topics (Published by Go Scanner)
 
@@ -22,7 +25,7 @@ Publishes the full state of the network scan. This message is published with the
     {
       "api_version": "integer (currently 1)",
       "scanner_version": "string (scanner build version)",
-      "schema_version": "integer (SQLite schema version, currently 1)",
+      "schema_version": "integer (SQLite schema version, currently 4)",
       "last_scan": "string (RFC3339 timestamp)",
       "duration": "string (seconds, e.g., '12.34s')",
       "scan_range": "string (active range persisted in SQLite)",
@@ -257,6 +260,95 @@ and `detail`. Consumers must ignore unknown fields. `detail` is sanitized and
 must not contain raw command output, credentials, broker addresses, filesystem
 paths, or arbitrary network responses; technical errors remain in scanner logs.
 
+### MQTT API v3 identity and configuration contract
+
+MQTT API v3 is the current coordinated compatibility boundary. A v3 Home Assistant
+integration approves only registrations advertising `api_version: 3`,
+`config_schema: 1`, and `progress_schema: 1`. V2 and v3 components must not be
+mixed. Registration also advertises a bounded `capabilities` array; consumers
+must ignore unknown capability names.
+
+The retained state payload adds a selected identity and at most 16 active
+observations per host:
+
+```json
+{
+  "api_version": 3,
+  "hosts": [{
+    "mac": "00:11:22:33:44:55",
+    "display_name": "Office Printer",
+    "display_name_source": "mdns",
+    "identity_observations": [{
+      "source": "mdns",
+      "kind": "friendly_name",
+      "value": "Office Printer",
+      "confidence": 80,
+      "stability": "transient",
+      "observed_address": "192.168.1.20",
+      "first_seen": "2026-11-13T12:00:00Z",
+      "last_seen": "2026-11-13T12:05:00Z",
+      "expires_at": "2026-11-14T12:05:00Z",
+      "evidence": {"service":"_ipp._tcp.local"}
+    }]
+  }]
+}
+```
+
+Observation `source` and `kind` use the closed vocabularies in ADR 0001.
+Values are UTF-8 text limited to 256 bytes; evidence is a JSON object limited
+to 2,048 encoded bytes. A host payload is limited to 16 active observations,
+ordered by display priority, confidence, and recency. The database may retain
+up to 64 active or historical observations per host.
+
+Home Assistant publishes the complete retained desired configuration to
+`fortag/scanners/{scanner_uuid}/desired/config` at QoS 1:
+
+```json
+{
+  "schema_version": 1,
+  "scanner_uuid": "8dff77be-651f-49d0-90dd-f9dc1ed7db59",
+  "revision": "4c45ca55-d61d-43e6-83c8-492bfebab2b4",
+  "collectors": {"mdns": true, "ssdp": true},
+  "automatic_targeted_scans": {"dhcp": false, "ipv6_ndp": false},
+  "updated_at": "2026-11-13T12:00:00Z"
+}
+```
+
+The scanner validates the topic UUID, schema, revision UUID, exact booleans,
+and payload size (maximum 16 KiB). Unknown keys are ignored and listed as
+unsupported. Invalid desired payloads do not replace the last effective
+configuration. It publishes retained reported configuration at QoS 1:
+
+```json
+{
+  "schema_version": 1,
+  "scanner_uuid": "8dff77be-651f-49d0-90dd-f9dc1ed7db59",
+  "instance_id": "a36c69e4-3432-4c97-b1b4-7085e9d989df",
+  "revision": "4c45ca55-d61d-43e6-83c8-492bfebab2b4",
+  "effective": {"collectors":{"mdns":true,"ssdp":true}},
+  "collector_health": {
+    "mdns": {"status":"running","updated_at":"2026-11-13T12:00:00Z"},
+    "ssdp": {"status":"running","updated_at":"2026-11-13T12:00:00Z"}
+  },
+  "errors": {},
+  "unsupported": [],
+  "updated_at": "2026-11-13T12:00:00Z"
+}
+```
+
+Collector health statuses are `disabled`, `running`, `degraded`, or
+`unavailable`; absence of observations never implies that a protocol is absent.
+
+V3 retained progress contains `schema_version: 1`, a monotonically increasing
+`revision`, scanner and instance IDs, an active job or `null`, a maximum of 64
+queued targeted jobs, and `updated_at`. Job objects contain `job_id`, `kind`,
+`source`, optional MAC, IPv4 target, phase, creation time, optional expiry, and
+queue position. `scan_target` accepts a command UUID, optional validated MAC,
+one IPv4 target inside the configured range, and source `user`; its terminal
+command result reports enqueue success with bounded `details.job_id` and
+`details.queue_position`. DHCP and NDP enqueue internally and never impersonate
+a user command.
+
 #### Home Assistant approval lease
 
 Retained discovery and instance-presence messages act as the scanner's
@@ -303,9 +395,10 @@ CREATE TABLE scanner_identity (
 The complete transactional migration and naming rules are defined in
 `ARCHITECTURE.md` section 3.
 
-#### Planned recoverable progress payload (post-MQTT-v2 beta)
+#### Remaining progress enhancements
 
-The later scan-recovery beta extends the retained
+The implemented v3 scheduler snapshot supersedes the earlier v2 recovery
+proposal. A later scan-recovery increment may extend the retained
 `fortag/scanners/{scanner_uuid}/progress` payload:
 
 ```json
@@ -322,7 +415,7 @@ The later scan-recovery beta extends the retained
 }
 ```
 
-Planned statuses are `idle`, `discovering`, `scanning_hosts`, `cancelling`,
+Possible additional statuses are `idle`, `discovering`, `scanning_hosts`, `cancelling`,
 `cancelled`, `completed`, `partial`, and `failed`. `target_index` is the
 one-based target currently running; `completed_targets` counts only finished
 targets. The final cancel/start topics and payloads remain a decision gate for
@@ -426,3 +519,18 @@ Triggers a manual network scan.
       "type": "fortag_scanner/scan_now"
     }
     ```
+
+### 2.6. `fortag_scanner/scan_target`
+
+Queues one device behind the active scan. The response contains its `job_id`
+and initial `queue_position`; retained progress is authoritative afterward.
+
+* **Request Format:**
+  ```json
+  {
+    "id": "integer",
+    "type": "fortag_scanner/scan_target",
+    "mac": "string (MAC address, or empty when unknown)",
+    "ip": "string (one private IPv4 address inside the configured range)"
+  }
+  ```

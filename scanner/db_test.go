@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -134,7 +135,7 @@ func TestInitDBRejectsNewerSchemaVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec("PRAGMA user_version = 3"); err != nil {
+	if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d", currentSchemaVersion+1)); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
@@ -150,7 +151,7 @@ func TestInitDBRejectsNewerSchemaVersion(t *testing.T) {
 	}
 }
 
-func TestInitDBMigratesVersion1ToVersion2(t *testing.T) {
+func TestInitDBMigratesVersion1ToCurrentVersion(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "version-one.db")
 	legacyDB, err := sql.Open("sqlite", dbPath)
 	if err != nil {
@@ -180,8 +181,8 @@ func TestInitDBMigratesVersion1ToVersion2(t *testing.T) {
 	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 2 {
-		t.Fatalf("schema version = %d, want 2", version)
+	if version != currentSchemaVersion {
+		t.Fatalf("schema version = %d, want %d", version, currentSchemaVersion)
 	}
 	if identity, err := getScannerIdentity(db); err != nil || identity.UUID == "" {
 		t.Fatalf("version 2 identity missing: %#v, %v", identity, err)

@@ -57,6 +57,38 @@ func DumpDatabase(db *sql.DB, w io.Writer) error {
 		}
 		portRows.Close()
 		hostMap["ports"] = ports
+
+		observationRows, err := db.Query(`SELECT source, kind, display_value,
+			confidence, stability, evidence_json, observed_address, collection_run,
+			first_seen, last_seen, expires_at, active
+			FROM identity_observations WHERE mac = ? ORDER BY id`, mac.String)
+		if err != nil {
+			return err
+		}
+		var observations []map[string]interface{}
+		for observationRows.Next() {
+			var source, kind, value, stability, firstSeen, lastSeen string
+			var evidence, address, run, expires sql.NullString
+			var confidence int
+			var active bool
+			if err := observationRows.Scan(&source, &kind, &value, &confidence,
+				&stability, &evidence, &address, &run, &firstSeen, &lastSeen,
+				&expires, &active); err != nil {
+				observationRows.Close()
+				return err
+			}
+			observations = append(observations, map[string]interface{}{
+				"source": source, "kind": kind, "value": value,
+				"confidence": confidence, "stability": stability,
+				"evidence": evidence.String, "observed_address": address.String,
+				"collection_run": run.String, "first_seen": firstSeen,
+				"last_seen": lastSeen, "expires_at": expires.String, "active": active,
+			})
+		}
+		if err := observationRows.Close(); err != nil {
+			return err
+		}
+		hostMap["identity_observations"] = observations
 		dump = append(dump, hostMap)
 	}
 

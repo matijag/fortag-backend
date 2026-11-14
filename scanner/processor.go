@@ -12,19 +12,22 @@ import (
 )
 
 type ScanResult struct {
-	MAC            string       `json:"mac"`
-	IP             string       `json:"ip"`
-	Hostname       string       `json:"hostname"`
-	CustomName     string       `json:"custom_name"`
-	OS             string       `json:"os"`
-	Ports          []PortResult `json:"ports"`
-	IsNewHost      bool         `json:"is_new_host"`
-	IsAcknowledged bool         `json:"is_acknowledged"`
-	IsRandomized   bool         `json:"is_randomized"`
-	IsCurrent      bool         `json:"is_current"`
-	MatchedFrom    string       `json:"matched_from"` // The old MAC this was bridged from
-	CreatedAt      string       `json:"created_at"`
-	LastSeen       string       `json:"last_seen"`
+	MAC            string            `json:"mac"`
+	IP             string            `json:"ip"`
+	Hostname       string            `json:"hostname"`
+	CustomName     string            `json:"custom_name"`
+	OS             string            `json:"os"`
+	Ports          []PortResult      `json:"ports"`
+	IsNewHost      bool              `json:"is_new_host"`
+	IsAcknowledged bool              `json:"is_acknowledged"`
+	IsRandomized   bool              `json:"is_randomized"`
+	IsCurrent      bool              `json:"is_current"`
+	MatchedFrom    string            `json:"matched_from"` // The old MAC this was bridged from
+	CreatedAt      string            `json:"created_at"`
+	LastSeen       string            `json:"last_seen"`
+	DisplayName    string            `json:"display_name"`
+	DisplaySource  string            `json:"display_name_source"`
+	Identity       []IdentitySummary `json:"identity_observations"`
 }
 
 type PortResult struct {
@@ -170,6 +173,9 @@ func ProcessScan(db *sql.DB, run EngineScanResult) ([]ScanResult, error) {
 
 		if err != nil {
 			return nil, fmt.Errorf("failed to process host %s: %w", mac, err)
+		}
+		if err := promotePendingIdentityObservations(tx, mac, ip, time.Now().UTC()); err != nil {
+			return nil, fmt.Errorf("associate identity observations with host %s: %w", mac, err)
 		}
 
 		// Snapshot the previous state before closing ports which were not observed
