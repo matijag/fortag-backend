@@ -292,7 +292,7 @@ func selectDisplayIdentity(db *sql.DB, mac string, now time.Time) (SelectedIdent
 	rows, err := db.Query(`SELECT source, kind, display_value FROM identity_observations
 		WHERE mac = ? AND active = 1 AND (expires_at IS NULL OR expires_at > ?)
 		ORDER BY CASE
-			WHEN source = 'home_assistant' THEN 1
+			WHEN source = 'home_assistant' AND kind = 'friendly_name' THEN 1
 			WHEN kind = 'friendly_name' AND source IN ('mdns', 'ssdp') THEN 2
 			WHEN kind = 'hostname' AND source = 'mdns' THEN 3
 			WHEN kind = 'hostname' AND source = 'llmnr' THEN 4

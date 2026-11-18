@@ -268,6 +268,9 @@ integration approves only registrations advertising `api_version: 3`,
 mixed. Registration also advertises a bounded `capabilities` array; consumers
 must ignore unknown capability names.
 
+Frontend `1.2.0b2` additionally requires the `home_assistant_registry`
+capability and therefore pairs with backend `1.2.0-rc.2` or newer.
+
 The retained state payload adds a selected identity and at most 16 active
 observations per host:
 
@@ -338,6 +341,39 @@ configuration. It publishes retained reported configuration at QoS 1:
 
 Collector health statuses are `disabled`, `running`, `degraded`, or
 `unavailable`; absence of observations never implies that a protocol is absent.
+
+Home Assistant publishes convergent device-registry knowledge to
+`fortag/scanners/{scanner_uuid}/desired/identity` at QoS 1 with retain enabled:
+
+```json
+{
+  "schema_version": 1,
+  "scanner_uuid": "8dff77be-651f-49d0-90dd-f9dc1ed7db59",
+  "revision": "9c0a7ccb-9851-46fb-aee6-456ae2ad11e5",
+  "devices": [{
+    "device_id": "home-assistant-device-id",
+    "name": "Office Printer",
+    "manufacturer": "Example",
+    "model": "Laser 2000",
+    "mac_addresses": ["00:11:22:33:44:55"],
+    "ip_addresses": ["192.168.1.20"]
+  }],
+  "updated_at": "2026-11-18T12:00:00Z"
+}
+```
+
+The payload is limited to 128 KiB, 256 devices, eight MAC addresses and eight
+RFC1918 IPv4 addresses per device, and 256 bytes per identity value. Devices
+without a name or correlation address are omitted. Fortag-owned registry
+devices and entities are excluded to prevent a feedback loop.
+
+The scanner correlates an exact MAC first. Only when no MAC matches may one
+IPv4 address correlate to exactly one current host. MAC matches create stable
+Home Assistant observations; IP-only matches are transient for 24 hours. A
+valid replacement snapshot deactivates Home Assistant observations no longer
+present. Invalid or oversized snapshots leave the previous effective
+observations unchanged. This topic represents desired knowledge and is not a
+command.
 
 V3 retained progress contains `schema_version: 1`, a monotonically increasing
 `revision`, scanner and instance IDs, an active job or `null`, a maximum of 64

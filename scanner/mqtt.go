@@ -173,7 +173,7 @@ func (m *MQTTClient) presencePayload(status string) string {
 		"api_version":     mqttAPIVersion,
 		"config_schema":   configSchemaVersion,
 		"progress_schema": progressSchemaVersion,
-		"capabilities":    []string{"identity_observations", "mdns", "ssdp", "targeted_scans", "scheduler_progress"},
+		"capabilities":    []string{"identity_observations", "home_assistant_registry", "mdns", "ssdp", "targeted_scans", "scheduler_progress"},
 	})
 	return string(payload)
 }
@@ -263,7 +263,7 @@ func (m *MQTTClient) publishRegistration() error {
 		"scan_range":      scanRange,
 		"config_schema":   configSchemaVersion,
 		"progress_schema": progressSchemaVersion,
-		"capabilities":    []string{"identity_observations", "mdns", "ssdp", "targeted_scans", "scheduler_progress"},
+		"capabilities":    []string{"identity_observations", "home_assistant_registry", "mdns", "ssdp", "targeted_scans", "scheduler_progress"},
 	}
 	if err := m.publish(fmt.Sprintf("fortag/discovery/%s/info", m.scannerUUID), 1, true, info); err != nil {
 		return err
@@ -489,6 +489,36 @@ func (m *MQTTClient) SubscribeDesiredConfig(apply func(desiredScannerConfig) err
 		}
 		if err := apply(config); err != nil {
 			log.Printf("ERROR: Desired config was rejected: %v", err)
+		}
+	})
+	token.Wait()
+	return token.Error()
+}
+
+func (m *MQTTClient) SubscribeHARegistry(apply func(HARegistrySnapshot) error) error {
+	topic := m.scannerTopic("desired/identity")
+	token := m.client.Subscribe(topic, 1, func(_ mqtt.Client, msg mqtt.Message) {
+		if len(msg.Payload()) == 0 {
+			if err := apply(HARegistrySnapshot{SchemaVersion: 1, ScannerUUID: m.scannerUUID}); err != nil {
+				log.Printf("ERROR: Home Assistant registry observations were not cleared: %v", err)
+			}
+			return
+		}
+		if len(msg.Payload()) > maxHARegistryPayloadBytes {
+			log.Printf("ERROR: Home Assistant registry payload exceeds %d bytes", maxHARegistryPayloadBytes)
+			return
+		}
+		var snapshot HARegistrySnapshot
+		if err := json.Unmarshal(msg.Payload(), &snapshot); err != nil {
+			log.Printf("ERROR: Invalid Home Assistant registry JSON: %v", err)
+			return
+		}
+		if err := validateHARegistrySnapshot(&snapshot, m.scannerUUID); err != nil {
+			log.Printf("ERROR: Invalid Home Assistant registry snapshot: %v", err)
+			return
+		}
+		if err := apply(snapshot); err != nil {
+			log.Printf("ERROR: Home Assistant registry snapshot was not applied: %v", err)
 		}
 	})
 	token.Wait()

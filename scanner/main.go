@@ -365,6 +365,25 @@ func main() {
 		}
 	}()
 
+	var haRegistrySnapshot atomic.Value
+	haRegistrySnapshot.Store(HARegistrySnapshot{})
+	applyCachedHARegistry := func() error {
+		snapshot := haRegistrySnapshot.Load().(HARegistrySnapshot)
+		if snapshot.Revision == "" {
+			return nil
+		}
+		return applyHARegistrySnapshot(db, snapshot, time.Now().UTC())
+	}
+	if err := mqttClient.SubscribeHARegistry(func(snapshot HARegistrySnapshot) error {
+		haRegistrySnapshot.Store(snapshot)
+		if err := applyHARegistrySnapshot(db, snapshot, time.Now().UTC()); err != nil {
+			return err
+		}
+		return publishCurrentState()
+	}); err != nil {
+		log.Fatalf("Subscribe to Home Assistant registry observations: %v", err)
+	}
+
 	doRoutineScan := func(ctx context.Context, _ ScanJob) error {
 		if !mqttClient.HasApproval() {
 			log.Println("Scan not started: MQTT connection or Home Assistant approval is unavailable.")
@@ -486,6 +505,14 @@ func main() {
 				detail: "Results may be current, but the last successful scan time could not be updated.",
 			})
 		}
+		if err := applyCachedHARegistry(); err != nil {
+			log.Printf("ERROR: Failed to correlate Home Assistant registry after scan: %v", err)
+			status = "partial"
+			safeFailures = append(safeFailures, scanFailure{
+				code: "identity_correlation_failed", message: "Home Assistant identity data could not be applied",
+				detail: "Scan results were saved, but Home Assistant device names may be stale.",
+			})
+		}
 
 		// Final full state publish uses the persisted scan-history metrics so
 		// later rename/acknowledge refreshes cannot corrupt them.
@@ -539,6 +566,10 @@ func main() {
 		}
 		for _, alert := range securityAlerts(processed) {
 			mqttClient.PublishAlert(alert.alertType, alert.mac, alert.extra)
+		}
+		if err := applyCachedHARegistry(); err != nil {
+			mqttClient.PublishScanOutcome("partial", "identity_correlation_failed", "Home Assistant identity data could not be applied", "Targeted scan results were saved, but Home Assistant device names may be stale.")
+			return err
 		}
 		if err := publishCurrentState(); err != nil {
 			mqttClient.PublishScanOutcome("partial", "state_publish_failed", "Updated results could not be published", "Home Assistant may continue showing older results for this host.")

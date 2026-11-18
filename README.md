@@ -2,7 +2,7 @@
 
 Fortag Backend is a stateful local-network security scanner. It discovers hosts
 on private IPv4 networks, scans their TCP ports with its native engine, stores history
-in SQLite, and publishes state and commands through MQTT API v2.
+in SQLite, and publishes state and commands through MQTT API v3.
 
 This repository contains the complete backend source, unit tests, integration
 tests, and container build configuration. The Home Assistant integration and
@@ -16,7 +16,8 @@ web panel are separate components.
 - Strict scan-target validation limited to RFC 1918 IPv4 networks.
 - SQLite schema migrations and durable device/port history.
 - Identity bridging for devices that rotate locally administered MAC addresses.
-- UUID-scoped MQTT API v2 topics and command-result correlation.
+- UUID-scoped MQTT API v3 topics, command-result correlation, and retained
+  Home Assistant device-registry identity correlation.
 - Home Assistant approval leases that prevent unapproved scanning.
 - Linux database locking to prevent concurrent writers.
 - Multi-platform container builds for `linux/amd64` and `linux/arm64`.
@@ -121,8 +122,8 @@ provide the image name explicitly:
 
 ```bash
 docker login
-IMAGE=matijag/fortag ./build-and-push.sh beta 1.1.0-rc.2
-IMAGE=matijag/fortag ./build-and-push.sh stable 1.1.0
+IMAGE=matijag/fortag ./build-and-push.sh beta 1.2.0-rc.2
+IMAGE=matijag/fortag ./build-and-push.sh stable 1.2.0
 ```
 
 Beta builds publish the exact version and `beta`. Stable builds publish the
@@ -130,8 +131,9 @@ exact version, its major/minor tag, and `latest`.
 
 ## Protocol
 
-See [docs/API.md](docs/API.md) for MQTT topics and payloads. MQTT API v2 is an
-incompatible change from v1; consumers must support the UUID-scoped namespace.
+See [docs/API.md](docs/API.md) for MQTT topics and payloads. MQTT API v3 is an
+incompatible change from earlier versions; consumers must support the
+UUID-scoped namespace and retained configuration and identity topics.
 
 ## Security
 
