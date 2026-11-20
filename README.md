@@ -122,7 +122,7 @@ provide the image name explicitly:
 
 ```bash
 docker login
-IMAGE=matijag/fortag ./build-and-push.sh beta 1.2.0-rc.2
+IMAGE=matijag/fortag ./build-and-push.sh beta 1.2.0-rc.3
 IMAGE=matijag/fortag ./build-and-push.sh stable 1.2.0
 ```
 

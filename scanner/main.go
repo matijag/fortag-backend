@@ -172,7 +172,6 @@ func getAllScanResults(db *sql.DB) ([]ScanResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
 	var results []ScanResult
 	for rows.Next() {
@@ -180,6 +179,7 @@ func getAllScanResults(db *sql.DB) ([]ScanResult, error) {
 		var hn, cn, osi sql.NullString
 		var createdAt, lastSeen sql.NullString
 		if err := rows.Scan(&r.MAC, &r.IP, &hn, &cn, &osi, &r.IsAcknowledged, &r.IsRandomized, &r.IsCurrent, &createdAt, &lastSeen); err != nil {
+			rows.Close()
 			return nil, err
 		}
 		r.Hostname = hn.String
@@ -187,6 +187,18 @@ func getAllScanResults(db *sql.DB) ([]ScanResult, error) {
 		r.OS = osi.String
 		r.CreatedAt = createdAt.String
 		r.LastSeen = lastSeen.String
+		results = append(results, r)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+
+	for index := range results {
+		r := &results[index]
 		selected, identityErr := selectDisplayIdentity(db, r.MAC, time.Now().UTC())
 		if identityErr != nil {
 			return nil, fmt.Errorf("select display identity for %s: %w", r.MAC, identityErr)
@@ -220,7 +232,6 @@ func getAllScanResults(db *sql.DB) ([]ScanResult, error) {
 		} else {
 			log.Printf("ERROR: Failed to query ports for %s: %v", r.MAC, err)
 		}
-		results = append(results, r)
 	}
 	return results, nil
 }

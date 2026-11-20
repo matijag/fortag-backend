@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -164,6 +165,32 @@ func TestGetAllScanResultsPublishesOnlyOpenPorts(t *testing.T) {
 	}
 	if len(results) != 1 || len(results[0].Ports) != 1 || results[0].Ports[0].Port != 80 {
 		t.Fatalf("published ports = %#v, want only 80/tcp open", results)
+	}
+}
+
+func TestGetAllScanResultsClosesHostRowsBeforeNestedQueries(t *testing.T) {
+	db, err := initDB(filepath.Join(t.TempDir(), "single-connection-state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(`INSERT INTO hosts (mac, ip) VALUES ('00:11:22:33:44:55', '192.168.1.5')`); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := getAllScanResults(db)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("getAllScanResults kept the only database connection busy")
 	}
 }
 
